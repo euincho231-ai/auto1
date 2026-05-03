@@ -1,0 +1,25 @@
+{
+  "README": "Registered withdrawal-address fallback. Replace demo values locally only; do not commit real addresses.",
+  "addresses": {
+    "Upbit:USDT:TRX": {
+      "address": "TUpbitDemoAddress9xA4C2F8KQ",
+      "tag": ""
+    },
+    "Bithumb:XRP:XRP": {
+      "address": "rBithumbDemoXrpAddress",
+      "tag": "442211"
+    },
+    "Binance:ETH:ETH": {
+      "address": "0xBinanceRegisteredDemoETH000000000000000",
+      "tag": ""
+    },
+    "Bybit:USDT:TRX": {
+      "address": "TBybitRegisteredDemoAddress",
+      "tag": ""
+    },
+    "Bitget:XRP:XRP": {
+      "address": "rBitgetRegisteredDemoXrp",
+      "tag": "500600"
+    }
+  }
+}

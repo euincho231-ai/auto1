@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>실시간 김프 모니터</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>실시간 김치 프리미엄 모니터</h1>
+          <p>국내 거래소 매수 1호가 / (해외 거래소 매도 1호가 × 국내 거래소 USDT/KRW 가격) - 1 에 100을 곱해 실시간 퍼센트를 계산합니다.</p>
+        </div>
+        <div id="clock" class="clock">연결 대기</div>
+      </header>
+
+      <section class="formula">
+        <strong>공식</strong>
+        <code>premiumPercent = (domestic_best_bid_krw / (foreign_best_ask_usdt * domestic_exchange_usdt_krw_price) - 1) * 100</code>
+      </section>
+
+      <section>
+        <h2>연결 상태</h2>
+        <div id="status" class="status-grid"></div>
+      </section>
+
+      <section>
+        <h2>요약</h2>
+        <div id="summary" class="summary-grid"></div>
+      </section>
+
+      <section>
+        <div class="toolbar">
+          <div>
+            <h2>자동 모의 차익거래</h2>
+            <p class="section-note">양수 김프이면서 최소 프리미엄 이상인 조합만 대상으로 현물 매수와 숏을 동시에 기록합니다. 현재는 PAPER_ONLY이며 실제 주문은 없습니다.</p>
+          </div>
+          <div class="controls">
+            <label class="control-label">
+              최소 프리미엄 %
+              <input id="minPremiumInput" type="number" min="0" max="20" step="0.01" />
+            </label>
+            <label class="control-label">
+              주문 USDT
+              <input id="notionalInput" type="number" min="5" step="5" />
+            </label>
+            <label class="control-label">
+              비용 버퍼 %
+              <input id="feeBufferInput" type="number" min="0" max="5" step="0.01" />
+            </label>
+            <label class="control-label">
+              최대 슬리피지 %
+              <input id="maxSlippageInput" type="number" min="0" max="10" step="0.01" />
+            </label>
+            <label class="check-label">
+              <input id="transferStatusInput" type="checkbox" />
+              입출금 상태 필요
+            </label>
+            <label class="check-label">
+              <input id="hedgeStatusInput" type="checkbox" />
+              헷징 상태 필요
+            </label>
+            <label class="control-label">
+              최소 선물 베이시스 %
+              <input id="minHedgeBasisInput" type="number" min="-2" max="5" step="0.01" />
+            </label>
+            <label class="control-label">
+              최대 선물 베이시스 %
+              <input id="maxHedgeBasisInput" type="number" min="0" max="20" step="0.01" />
+            </label>
+            <label class="control-label">
+              최소 헷지 깊이 USDT
+              <input id="minHedgeDepthInput" type="number" min="0" step="10" />
+            </label>
+            <label class="control-label">
+              자동 제외 김프 %
+              <input id="maxPremiumInput" type="number" min="1" max="100" step="1" />
+            </label>
+            <label class="control-label">
+              최소 깊이 USDT
+              <input id="minDepthInput" type="number" min="0" step="10" />
+            </label>
+            <label class="control-label">
+              MM 분할 수
+              <input id="mmLevelsInput" type="number" min="1" max="10" step="1" />
+            </label>
+            <label class="control-label">
+              MM 간격 %
+              <input id="mmStepInput" type="number" min="0" max="2" step="0.01" />
+            </label>
+            <button id="saveSettingsBtn">설정 적용</button>
+            <button id="autoPaperBtn" class="secondary">자동 모의 OFF</button>
+            <button id="emergencyBtn" class="danger">긴급 정지 OFF</button>
+          </div>
+        </div>
+        <div id="eligible" class="signal-grid"></div>
+      </section>
+
+      <section>
+        <h2>MM 매도 최적화</h2>
+        <p class="section-note">MM은 차익거래의 주 수단이 아니라 국내 매도 시 가격 방어와 슬리피지 감소를 위한 보조 도구입니다. 국내 양방향 MM, 매수 호가 배치, 허수 주문, 스푸핑은 금지합니다.</p>
+        <div id="mmPlans" class="signal-grid"></div>
+      </section>
+
+      <section>
+        <h2>전송 프리미엄 감시 / 대기창</h2>
+        <p class="section-note">해외 매수 시점부터 국내 도착 예상 시점까지 프리미엄을 계속 추적합니다. 도착 시 기준 미달이면 대기창에 남고, 다시 기준을 넘으면 국내 매도와 숏 청산을 모의 처리합니다. 필요하면 수동 복귀를 눌러 원래 거래소에서 현물 매도와 숏 청산을 모의 처리할 수 있습니다.</p>
+        <div id="transferQueue" class="signal-grid"></div>
+      </section>
+
+      <section>
+        <div class="toolbar">
+          <div>
+            <h2>현물 매도 + 숏 청산</h2>
+            <p class="section-note">입금 확인 후 매도 직전 프리미엄을 다시 보고, 실제 현물 매도 체결량만큼만 숏을 reduce-only 성격으로 비례 청산하는 모의 출구 엔진입니다.</p>
+          </div>
+          <div class="controls">
+            <button id="recentSettlementBtn" class="secondary">최근 30분 체결 정산</button>
+          </div>
+        </div>
+        <div id="exitEngine" class="signal-grid"></div>
+      </section>
+
+      <section>
+        <h2>정산 카드</h2>
+        <div id="settlements" class="signal-grid"></div>
+      </section>
+
+      <section class="withdrawal-section">
+        <div class="toolbar">
+          <div>
+            <h2>안전 출금/전송</h2>
+            <p class="section-note">출발/도착 거래소의 자산·네트워크 교집합과 주소, Memo/Tag, 수수료, 최소 수량을 검증합니다. 이 기능은 데모 상태 추적만 수행하며 실제 출금 API를 호출하지 않습니다.</p>
+          </div>
+          <div class="controls">
+            <button id="withdrawalRefreshBtn" class="secondary">출금 이력 새로고침</button>
+          </div>
+        </div>
+
+        <div id="withdrawalSafety" class="safety-pills"></div>
+        <div id="withdrawalNotice" class="withdrawal-notice"></div>
+
+        <div class="withdrawal-grid">
+          <div class="withdrawal-panel">
+            <h3>출금 검증</h3>
+            <div class="withdrawal-form">
+              <label class="control-label">
+                출발 거래소
+                <select id="withdrawalSource"></select>
+              </label>
+              <label class="control-label">
+                도착 거래소
+                <select id="withdrawalDestination"></select>
+              </label>
+              <label class="control-label">
+                자산
+                <select id="withdrawalAsset"></select>
+              </label>
+              <label class="control-label">
+                네트워크 교집합
+                <select id="withdrawalNetwork"></select>
+              </label>
+              <label class="control-label">
+                수량
+                <input id="withdrawalAmount" type="number" min="0" step="0.000001" value="10" />
+            </label>
+            <label class="control-label">
+              자산 코드 재입력
+              <input id="withdrawalConfirmAsset" type="text" placeholder="USDT" />
+            </label>
+              <label class="control-label">
+                JSON 설정 불러오기
+                <input id="withdrawalJsonImport" type="file" accept=".json,application/json" />
+              </label>
+              <label class="control-label">
+                ENV 설정 불러오기
+                <input id="withdrawalEnvImport" type="file" accept=".env,.txt,text/plain" />
+              </label>
+            </div>
+            <label class="check-label withdrawal-approval">
+              <input id="withdrawalManualApproval" type="checkbox" />
+              수동 승인: 주소, 네트워크, Memo/Tag, 수량을 확인했습니다.
+            </label>
+            <div class="withdrawal-actions">
+              <button id="withdrawalQuoteBtn" class="secondary">견적 갱신</button>
+              <button id="withdrawalSubmitBtn">데모 제출</button>
+            </div>
+          </div>
+
+          <div class="withdrawal-panel">
+            <h3>견적 / 주소</h3>
+            <div id="withdrawalQuote" class="withdrawal-summary"></div>
+          </div>
+        </div>
+
+        <div class="withdrawal-grid">
+          <div class="withdrawal-panel">
+            <h3>데모 제출 이력</h3>
+            <div class="table-wrap compact-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th>요청</th>
+                    <th>경로</th>
+                    <th>수량</th>
+                    <th>상태</th>
+                    <th>TXID</th>
+                    <th>진행</th>
+                  </tr>
+                </thead>
+                <tbody id="withdrawalHistory"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="withdrawal-panel">
+            <h3>상세 이벤트</h3>
+            <div id="withdrawalEvents" class="log-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>리스크 / 잔고 / 알림</h2>
+        <div class="ops-grid">
+          <div>
+            <h3>리스크 이벤트</h3>
+            <div id="riskEvents" class="log-list"></div>
+          </div>
+          <div>
+            <h3>모의 잔고</h3>
+            <div id="balances" class="log-list"></div>
+          </div>
+          <div>
+            <h3>최근 알림</h3>
+            <div id="alerts" class="log-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="toolbar">
+          <div>
+            <h2>실거래 게이트</h2>
+            <p class="section-note">실제 주문은 기본 차단됩니다. .env 키, 실거래 플래그, 수동 arm, 최근 paper 성공, 리스크 검사를 모두 통과해야만 제한 주문 경로가 열립니다. 출금과 자동 리밸런싱은 계속 비활성화됩니다.</p>
+          </div>
+          <div class="controls">
+            <label class="control-label">
+              실거래 최대 USDT
+              <input id="liveMaxInput" type="number" min="5" max="200" step="5" />
+            </label>
+            <button id="liveRequestBtn" class="secondary">실거래 요청 OFF</button>
+            <button id="liveDisarmBtn" class="danger">실거래 ARM 해제</button>
+          </div>
+        </div>
+        <div id="liveGate" class="signal-grid"></div>
+      </section>
+
+      <section>
+        <h2>모의 체결 기록</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>시간</th>
+                <th>전략</th>
+                <th>코인</th>
+                <th>국내 기준</th>
+                <th>해외 실행</th>
+                <th>수량</th>
+                <th>김프 %</th>
+                <th>예상 순엣지 KRW</th>
+              </tr>
+            </thead>
+            <tbody id="paperTrades"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <div class="toolbar">
+          <h2>실시간 비교</h2>
+          <div class="controls">
+            <select id="symbolFilter">
+              <option value="all">전체 코인</option>
+              <option value="BTC">BTC</option>
+              <option value="ETH">ETH</option>
+              <option value="XRP">XRP</option>
+              <option value="SOL">SOL</option>
+            </select>
+            <select id="domesticFilter">
+              <option value="all">전체 국내</option>
+              <option value="upbit">업비트</option>
+              <option value="bithumb">빗썸</option>
+            </select>
+            <select id="foreignFilter">
+              <option value="all">전체 해외</option>
+              <option value="binance">바이낸스</option>
+              <option value="bybit">바이비트</option>
+              <option value="bitget">비트겟</option>
+              <option value="gate">게이트</option>
+            </select>
+            <div class="legend">
+              <span class="dot positive"></span> 국내 비쌈
+              <span class="dot negative"></span> 국내 저렴
+              <span class="dot stale"></span> stale
+            </div>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>코인</th>
+                <th>국내</th>
+                <th>해외</th>
+                <th>국내 매수1호가 KRW</th>
+                <th>해외 매도1호가 USDT</th>
+                <th>USDT/KRW</th>
+                <th>김프 %</th>
+                <th>실질 %</th>
+                <th>슬리피지</th>
+                <th>깊이 USDT</th>
+                <th>리스크</th>
+                <th>상태</th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

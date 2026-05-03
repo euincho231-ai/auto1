@@ -1,0 +1,519 @@
+:root {
+  --bg: #eef1f5;
+  --panel: #ffffff;
+  --line: #d9dee7;
+  --ink: #15202b;
+  --muted: #637083;
+  --green: #067647;
+  --red: #b42318;
+  --amber: #b54708;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+main {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  align-items: flex-start;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 18px;
+}
+
+h1, h2 { margin: 0; }
+h1 { font-size: 28px; }
+h2 { font-size: 18px; }
+p { color: var(--muted); line-height: 1.55; margin: 8px 0 0; }
+.section-note { max-width: 760px; font-size: 14px; }
+
+section {
+  margin-top: 18px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.clock {
+  min-width: 220px;
+  text-align: right;
+  font-weight: 800;
+  color: var(--muted);
+}
+
+.formula {
+  display: grid;
+  gap: 8px;
+}
+
+code {
+  display: block;
+  overflow-x: auto;
+  border-radius: 6px;
+  background: #f6f8fb;
+  border: 1px solid var(--line);
+  padding: 12px;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.status-card {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px;
+  background: #fbfcfe;
+}
+
+.status-card strong {
+  display: block;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+select {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: white;
+  padding: 8px 10px;
+  color: var(--ink);
+}
+
+input {
+  width: 110px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: white;
+  padding: 8px 10px;
+  color: var(--ink);
+}
+
+button {
+  border: 0;
+  border-radius: 6px;
+  background: var(--ink);
+  color: white;
+  padding: 9px 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: #475467;
+}
+
+button.active {
+  background: var(--green);
+}
+
+button.danger {
+  background: var(--red);
+}
+
+button.warn {
+  background: var(--amber);
+}
+
+button.disabled,
+button:disabled {
+  background: #98a2b3;
+  cursor: not-allowed;
+}
+
+button.link-button {
+  background: transparent;
+  color: var(--ink);
+  padding: 0;
+  text-align: left;
+}
+
+.control-label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.legend {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.signal-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.signal-card {
+  border: 1px solid #abefc6;
+  border-radius: 6px;
+  padding: 14px;
+  background: #ecfdf3;
+}
+
+.signal-card strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.mini-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.forbidden {
+  margin-top: 8px;
+  color: var(--red);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.ops-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.log-list {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.log-item {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+  background: #fbfcfe;
+  font-size: 13px;
+}
+
+.risk-reason {
+  max-width: 240px;
+  white-space: normal;
+  color: var(--amber);
+  font-weight: 800;
+}
+
+.summary-card {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 14px;
+  background: #fbfcfe;
+}
+
+.summary-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.summary-value {
+  margin-top: 8px;
+  font-size: 24px;
+  font-weight: 900;
+}
+
+.summary-meta {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.positive { background: var(--green); }
+.negative { background: var(--red); }
+.stale { background: var(--amber); }
+
+.table-wrap {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 1050px;
+  background: white;
+}
+
+th, td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #edf0f4;
+  text-align: right;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+th {
+  background: #f7f8fb;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+th:first-child, td:first-child,
+th:nth-child(2), td:nth-child(2),
+th:nth-child(3), td:nth-child(3),
+th:last-child, td:last-child {
+  text-align: left;
+}
+
+.premium {
+  font-weight: 900;
+}
+
+.premium.positive-text { color: var(--green); }
+.premium.negative-text { color: var(--red); }
+.stale-text { color: var(--amber); font-weight: 800; }
+.ok-text { color: var(--green); font-weight: 800; }
+
+.withdrawal-section {
+  background: #ffffff;
+}
+
+.safety-pills {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+.safety-pill {
+  border-radius: 999px;
+  padding: 5px 9px;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.safety-pill.ok {
+  background: #dcfae6;
+  color: var(--green);
+}
+
+.safety-pill.danger {
+  background: #fee4e2;
+  color: var(--red);
+}
+
+.safety-pill.off {
+  background: #eef2f6;
+  color: var(--muted);
+}
+
+.withdrawal-notice {
+  min-height: 20px;
+  margin: 8px 0 12px;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.withdrawal-notice.ok {
+  color: var(--green);
+}
+
+.withdrawal-notice.warn {
+  color: var(--amber);
+}
+
+.withdrawal-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 0.85fr);
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.withdrawal-panel {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 14px;
+  background: #fbfcfe;
+}
+
+.withdrawal-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.withdrawal-form input,
+.withdrawal-form select {
+  width: 100%;
+}
+
+.withdrawal-form input[type="file"] {
+  padding: 8px;
+  font-size: 12px;
+}
+
+.withdrawal-approval {
+  margin-top: 12px;
+}
+
+.withdrawal-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.withdrawal-summary {
+  display: grid;
+  gap: 9px;
+  margin-top: 12px;
+}
+
+.withdrawal-row {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  font-size: 14px;
+}
+
+.withdrawal-row span {
+  color: var(--muted);
+}
+
+.withdrawal-row strong {
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.withdrawal-messages {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.payload-preview {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #111827;
+  color: #d1fae5;
+  padding: 10px;
+  font-size: 12px;
+}
+
+.payload-preview div {
+  color: #fbbf24;
+  font-weight: 900;
+  margin-bottom: 6px;
+}
+
+.payload-preview pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.withdrawal-messages div {
+  border-radius: 6px;
+  padding: 9px 10px;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.withdrawal-messages .ok {
+  background: #ecfdf3;
+  color: var(--green);
+}
+
+.withdrawal-messages .warn {
+  background: #fffaeb;
+  color: var(--amber);
+}
+
+.compact-table table {
+  min-width: 820px;
+}
+
+.mono-cell {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+@media (max-width: 800px) {
+  main { padding: 14px; }
+  header { flex-direction: column; }
+  .clock { text-align: left; }
+  .toolbar { align-items: flex-start; flex-direction: column; }
+  .controls { justify-content: flex-start; }
+  .ops-grid { grid-template-columns: 1fr; }
+  .withdrawal-grid,
+  .withdrawal-form {
+    grid-template-columns: 1fr;
+  }
+}
