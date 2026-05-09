@@ -31,19 +31,19 @@ Other routes remain monitored and paper-traded only until their private order ad
 Arm is intentionally temporary. It expires automatically.
 
 ```bash
-curl -X POST "http://localhost:4173/api/live-arm?confirm=ENABLE_REAL_MONEY_TRADING&minutes=10"
+curl -X POST "http://localhost:4191/api/live-arm?confirm=ENABLE_REAL_MONEY_TRADING&minutes=10"
 ```
 
 Disarm immediately:
 
 ```bash
-curl -X POST "http://localhost:4173/api/live-disarm"
+curl -X POST "http://localhost:4191/api/live-disarm"
 ```
 
 Readiness check:
 
 ```bash
-curl http://localhost:4173/api/live-readiness
+curl http://localhost:4191/api/live-readiness
 ```
 
 ## Important operating notes

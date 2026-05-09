@@ -47,7 +47,7 @@
               <input id="notionalInput" type="number" min="5" step="5" />
             </label>
             <label class="control-label">
-              비용 버퍼 %
+              체결 레그당 수수료 %
               <input id="feeBufferInput" type="number" min="0" max="5" step="0.01" />
             </label>
             <label class="control-label">
@@ -75,6 +75,10 @@
               <input id="minHedgeDepthInput" type="number" min="0" step="10" />
             </label>
             <label class="control-label">
+              최대 레버리지
+              <input id="maxLeverageInput" type="number" min="1" max="4" step="0.1" />
+            </label>
+            <label class="control-label">
               자동 제외 김프 %
               <input id="maxPremiumInput" type="number" min="1" max="100" step="1" />
             </label>
@@ -95,6 +99,7 @@
             <button id="emergencyBtn" class="danger">긴급 정지 OFF</button>
           </div>
         </div>
+        <div id="executionPreflight" class="withdrawal-notice"></div>
         <div id="eligible" class="signal-grid"></div>
       </section>
 
@@ -161,6 +166,10 @@
               <label class="control-label">
                 네트워크 교집합
                 <select id="withdrawalNetwork"></select>
+              </label>
+              <label class="control-label">
+                수동 네트워크 입력
+                <input id="withdrawalManualNetwork" type="text" placeholder="예: TRX, BSC, ETH" />
               </label>
               <label class="control-label">
                 수량
@@ -237,6 +246,12 @@
             <div id="alerts" class="log-list"></div>
           </div>
         </div>
+      </section>
+
+      <section>
+        <h2>김프/역프 USDT 리밸런싱 계획</h2>
+        <p class="section-note">김프 때는 해외 매수용 USDT를 해외 거래소에 채우고, 역프 때는 국내 매수용 KRW를 만들기 위해 해외 USDT를 국내로 가져오는 계획을 계산합니다. 두 방향 모두 일일 한도, API-only 네트워크/주소 확인, 수동 승인 없이는 실행하지 않습니다.</p>
+        <div id="rebalancePlans" class="signal-grid"></div>
       </section>
 
       <section>

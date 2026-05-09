@@ -12,7 +12,12 @@ let SYMBOLS = [...DEFAULT_SYMBOLS];
 const DOMESTIC = ["upbit", "bithumb"];
 const FOREIGN = ["binance", "bybit", "bitget", "gate"];
 const STALE_MS = 8_000;
-const TRADE_COOLDOWN_MS = 30_000;
+const TRADE_COOLDOWN_MS = 15_000;
+const EXIT_RETRY_MS = 15_000;
+const MIN_GLOBAL_ORDER_USDT = 1;
+const MIN_DOMESTIC_ORDER_KRW = 5_000;
+const API_TIMEOUT_MS = Number(process.env.EXCHANGE_API_TIMEOUT_MS || 4500);
+const PREFLIGHT_CAPABILITY_CACHE_MS = Number(process.env.PREFLIGHT_CAPABILITY_CACHE_MS || 60_000);
 const EXCLUDED_ASSETS = new Set(["USDT", "KRW"]);
 const LIVE_ARM_PHRASE = "ENABLE_REAL_MONEY_TRADING";
 const LIVE_SUPPORTED_ROUTES = new Set(["upbit:binance"]);
@@ -185,18 +190,20 @@ const state = {
   settings: {
     minPremiumPercent: Number(process.env.MIN_PREMIUM_PERCENT || 0.15),
     orderNotionalUsdt: Number(process.env.ORDER_NOTIONAL_USDT || 100),
-    feeBufferPercent: Number(process.env.FEE_BUFFER_PERCENT || 0.12),
+    feeBufferPercent: Number(process.env.FEE_BUFFER_PERCENT || 0.1),
     maxSlippagePercent: Number(process.env.MAX_SLIPPAGE_PERCENT || 0.25),
     maxAutoPremiumPercent: Number(process.env.MAX_AUTO_PREMIUM_PERCENT || 20),
     maxDomesticPriceDivergencePercent: Number(process.env.MAX_DOMESTIC_PRICE_DIVERGENCE_PERCENT || 15),
     transferMinSeconds: Number(process.env.TRANSFER_MIN_SECONDS || 480),
     transferMaxSeconds: Number(process.env.TRANSFER_MAX_SECONDS || 900),
     requireTransferStatusForPaper: process.env.REQUIRE_TRANSFER_STATUS_FOR_PAPER !== "false",
+    requireApiExecutionPreflight: process.env.REQUIRE_API_EXECUTION_PREFLIGHT !== "false",
     allowSimulatedTransferStatus: process.env.ALLOW_SIMULATED_TRANSFER_STATUS === "true",
     requireHedgeStatusForPaper: process.env.REQUIRE_HEDGE_STATUS_FOR_PAPER !== "false",
     minHedgeBasisPercent: Number(process.env.MIN_HEDGE_BASIS_PERCENT || 0),
     maxHedgeBasisPercent: Number(process.env.MAX_HEDGE_BASIS_PERCENT || 1.5),
     minHedgeDepthUsdt: Number(process.env.MIN_HEDGE_DEPTH_USDT || 50),
+    maxLeverage: Math.min(4, Math.max(1, Number(process.env.MAX_LEVERAGE || 4))),
     minDepthUsdt: Number(process.env.MIN_DEPTH_USDT || 50),
     maxDataAgeMs: Number(process.env.MAX_DATA_AGE_MS || STALE_MS),
     maxApiLatencyMs: Number(process.env.MAX_API_LATENCY_MS || 1200),
@@ -213,6 +220,16 @@ const state = {
     withdrawalEnabled: false,
     autoRebalanceEnabled: false,
     internalTransferEnabled: process.env.ENABLE_INTERNAL_TRANSFER === "true",
+    minForeignUsdtReserve: Number(process.env.MIN_FOREIGN_USDT_RESERVE || 500),
+    minDomesticKrwReserve: Number(process.env.MIN_DOMESTIC_KRW_RESERVE || 1000000),
+    inversePremiumTriggerPercent: Number(process.env.INVERSE_PREMIUM_TRIGGER_PERCENT || 0.15),
+    kimchiPremiumRebalanceTriggerPercent: Number(process.env.KIMCHI_PREMIUM_REBALANCE_TRIGGER_PERCENT || 0.15),
+    dailyForeignUsdtTopupLimitUsdt: Number(process.env.DAILY_FOREIGN_USDT_TOPUP_LIMIT_USDT || 1000),
+    dailyRebalanceWithdrawLimitUsdt: Number(process.env.DAILY_REBALANCE_WITHDRAW_LIMIT_USDT || 1000),
+    todayForeignUsdtTopupUsdt: 0,
+    todayRebalanceWithdrawnUsdt: 0,
+    telegramCommandEnabled: process.env.TELEGRAM_COMMAND_ENABLED === "true",
+    telegramLastUpdateId: 0,
     autoPaperTrading: true,
     liveTrading: false,
     liveTradingRequested: process.env.LIVE_TRADING === "true",
@@ -227,16 +244,20 @@ const state = {
   },
   withdrawalRequests: [],
   internalTransfers: [],
+  executionApiCache: {},
   paperTrades: [],
   transferPositions: [],
   exitPositions: [],
   settlements: [],
   transferStatusCache: {},
+  entryPlans: {},
   riskEvents: [],
   botEvents: [],
   alerts: [],
   simulatedBalances: {
     KRW: 100_000_000,
+    domesticUsdt: 0,
+    foreignUsdt: 10_000,
     USDT: 10_000,
     BTC: 1,
     ETH: 10,
@@ -310,7 +331,14 @@ const server = http.createServer((req, res) => {
     readPayload(req, url).then((payload) => sendJson(res, withdrawalAdvance(payload.id || url.searchParams.get("id")))).catch((error) => sendJson(res, { ok: false, error: error.message }));
     return;
   }
-  if (url.pathname === "/api/internal-transfer" && req.method === "POST") {
+  if (url.pathname === "/api/execution-preflight" && req.method === "POST") {
+    readPayload(req, url).then((payload) => executionPreflight(payload)).then((result) => sendJson(res, result)).catch((error) => {
+      addRiskEvent("EXECUTION_PREFLIGHT_ERROR", "high", error.message);
+      sendJson(res, { ok: false, canExecute: false, error: error.message });
+    });
+    return;
+  }
+  if (url.pathname === "/api/internal-transfer" && ["GET", "POST"].includes(req.method)) {
     handleInternalTransfer(url.searchParams).then((result) => sendJson(res, result)).catch((error) => {
       addRiskEvent("INTERNAL_TRANSFER_FAILED", "critical", error.message);
       sendJson(res, { ok: false, error: error.message });
@@ -402,12 +430,13 @@ server.listen(PORT, () => {
 
 init();
 setInterval(broadcast, 1_000);
-setInterval(autoPaperTrade, 1_500);
+setInterval(() => autoPaperTrade().catch((error) => addRiskEvent("AUTO_PAPER_TRADE_LOOP_FAILED", "high", error.message)), 1_500);
 setInterval(autoLiveTrade, 2_000);
 setInterval(monitorTransferPositions, 2_000);
-setInterval(processExitPositions, 2_000);
+setInterval(processExitPositions, EXIT_RETRY_MS);
 setInterval(refreshOperationalStatus, 60_000);
 setInterval(refreshHedgeQuotes, 10_000);
+setInterval(() => pollTelegramCommands().catch((error) => addRiskEvent("TELEGRAM_COMMAND_POLL_FAILED", "medium", error.message)), 5_000);
 
 async function init() {
   await loadMarketUniverse();
@@ -523,6 +552,7 @@ function snapshot() {
     transferPositions: state.transferPositions.slice(0, 80),
     exitPositions: state.exitPositions.slice(0, 80),
     settlements: state.settlements.slice(0, 50),
+    rebalancePlans: buildRebalancePlans(rows),
     riskEvents: state.riskEvents.slice(0, 50),
     botEvents: state.botEvents.slice(0, 50),
     alerts: state.alerts.slice(0, 20),
@@ -584,7 +614,7 @@ function buildRows() {
         const premium = domesticSell && foreignBuy && usdtKrw
           ? ((domesticSell / (foreignBuy * usdtKrw)) - 1) * 100
           : null;
-        const netPremium = premium == null ? null : premium - state.settings.feeBufferPercent;
+        const netPremium = premium == null ? null : premium - roundTripTradingFeePercent();
         const transferStatus = getTransferStatus(asset, foreignExchange, domesticExchange, {
           quantity,
           domesticSell,
@@ -593,6 +623,10 @@ function buildRows() {
           netPremiumPercent: netPremium
         });
         const hedgeStatus = chooseHedgeVenue(asset, foreignBuy);
+        const entryKey = `${asset}:${domesticExchange}:${foreignExchange}`;
+        const entryCompletedUsdt = state.entryPlans[entryKey]?.completedUsdt ?? 0;
+        const entryRemainingUsdt = Math.max(0, state.settings.orderNotionalUsdt - entryCompletedUsdt);
+        const domesticExitCapacity = d?.bid ? orderbookCapacityWithinSlippage(d.bids, "sell", d.bid, Infinity) : null;
         const row = {
           asset,
           domesticExchange,
@@ -626,6 +660,14 @@ function buildRows() {
           domesticFill,
           foreignFill,
           usdtFill,
+          exitLiquidity: {
+            spotSellSafeQuantity: domesticExitCapacity?.quantity ?? 0,
+            spotSellSafeKrw: domesticExitCapacity?.notional ?? 0,
+            spotSellLastPrice: domesticExitCapacity?.lastPrice ?? null,
+            spotSellWorstAllowedPrice: domesticExitCapacity?.worstAllowedPrice ?? null,
+            shortCloseSafeQuantity: hedgeStatus.futuresAsk > 0 ? (hedgeStatus.askDepthUsdt ?? 0) / hedgeStatus.futuresAsk : 0,
+            shortCloseSafeUsdt: hedgeStatus.askDepthUsdt ?? 0
+          },
           slippagePercent: Math.max(domesticFill?.slippagePercent ?? 0, foreignFill?.slippagePercent ?? 0, usdtFill?.slippagePercent ?? 0),
           availableDepthUsdt: Math.min(
             Number.isFinite((d?.bidQty ?? 0) * (d?.bid ?? 0) / (usdt?.price || 1)) ? (d?.bidQty ?? 0) * (d?.bid ?? 0) / (usdt?.price || 1) : 0,
@@ -637,6 +679,7 @@ function buildRows() {
           fundingCostPercent: 0,
           transferStatus,
           hedgeStatus,
+          entryPlan: null,
           eligible: false,
           stale,
           updatedAgoMs: {
@@ -645,6 +688,7 @@ function buildRows() {
             usdt: usdt ? now - usdt.ts : null
           }
         };
+        row.entryPlan = buildEntryPlan(row, f, entryCompletedUsdt, entryRemainingUsdt);
         row.risk = evaluateRow(row);
         rows.push(row);
       }
@@ -657,6 +701,129 @@ function buildRows() {
     state.premiumHistory = state.premiumHistory.slice(-1000);
   }
   return rows;
+}
+
+function buildRebalancePlans(rows = []) {
+  const plans = [];
+  const bestUpbitUsdt = state.usdtKrw.upbit?.price || null;
+  const bestBithumbUsdt = state.usdtKrw.bithumb?.price || null;
+  const domesticUsdtKrw = bestBithumbUsdt || bestUpbitUsdt || null;
+  const foreignUsdt = Number(state.simulatedBalances.foreignUsdt ?? state.simulatedBalances.USDT ?? 0);
+  const domesticUsdt = Number(state.simulatedBalances.domesticUsdt ?? 0);
+  const krw = Number(state.simulatedBalances.KRW ?? 0);
+  const inverseRows = rows
+    .filter((row) => !hasStale(row) && Number.isFinite(row.premiumPercent) && row.premiumPercent <= -Math.abs(state.settings.inversePremiumTriggerPercent))
+    .sort((a, b) => (a.premiumPercent ?? 0) - (b.premiumPercent ?? 0));
+  const kimchiRows = rows
+    .filter((row) => !hasStale(row) && Number.isFinite(row.premiumPercent) && row.premiumPercent >= Math.abs(state.settings.kimchiPremiumRebalanceTriggerPercent))
+    .sort((a, b) => (b.premiumPercent ?? 0) - (a.premiumPercent ?? 0));
+  const bestInverse = inverseRows[0] || null;
+  const bestKimchi = kimchiRows[0] || null;
+  const remainingDailyWithdrawUsdt = Math.max(0, state.settings.dailyRebalanceWithdrawLimitUsdt - state.settings.todayRebalanceWithdrawnUsdt);
+  const remainingForeignTopupUsdt = Math.max(0, state.settings.dailyForeignUsdtTopupLimitUsdt - state.settings.todayForeignUsdtTopupUsdt);
+  const shortageUsdt = Math.max(0, state.settings.orderNotionalUsdt + state.settings.minForeignUsdtReserve - foreignUsdt);
+  if (bestKimchi && shortageUsdt > 0) {
+    const plannedTopupUsdt = Math.min(shortageUsdt, remainingForeignTopupUsdt);
+    plans.push({
+      id: "KIMCHI_PREMIUM_FOREIGN_USDT_TOPUP",
+      severity: "high",
+      status: state.settings.autoRebalanceEnabled ? "NEEDS_MANUAL_APPROVAL_BEFORE_LIVE" : "LOCKED_AUTO_REBALANCE_OFF",
+      title: "김프 진입용 해외 USDT 확보",
+      reason: `${bestKimchi.asset} 김프 ${formatPlain(bestKimchi.premiumPercent)}% 감지 · 해외 USDT ${formatPlain(foreignUsdt)} < 필요 ${formatPlain(state.settings.orderNotionalUsdt + state.settings.minForeignUsdtReserve)}`,
+      preferredFlow: domesticUsdt >= shortageUsdt
+        ? "국내 거래소 USDT 잔고를 일일 한도 안에서 API-only 출금 사전점검 후 해외 거래소로 전송"
+        : "국내 KRW로 USDT/KRW 호가에서 USDT를 매수한 뒤 일일 한도 안에서 API-only 출금 사전점검 후 해외 거래소로 전송",
+      requiredChecks: [
+        "김프가 설정 기준 이상인지 확인",
+        "국내 USDT/KRW ask 호가 깊이와 슬리피지",
+        "국내 거래소 USDT 출금 네트워크",
+        "해외 거래소 USDT 입금 네트워크와 API 입금 주소",
+        "USDT 출금 수수료와 KRW->USDT 매수 수수료",
+        "해외 USDT 충전 일일 한도 잔여분",
+        "ENABLE_AUTO_REBALANCE=true + 수동 승인"
+      ],
+      kimchiAsset: bestKimchi.asset,
+      kimchiPremiumPercent: bestKimchi.premiumPercent,
+      estimatedNeedUsdt: shortageUsdt,
+      dailyTopupLimitUsdt: state.settings.dailyForeignUsdtTopupLimitUsdt,
+      todayTopupUsdt: state.settings.todayForeignUsdtTopupUsdt,
+      remainingDailyTopupUsdt: remainingForeignTopupUsdt,
+      plannedTopupUsdt,
+      estimatedKrwToBuyUsdt: domesticUsdt >= shortageUsdt || !domesticUsdtKrw ? 0 : (shortageUsdt - domesticUsdt) * domesticUsdtKrw,
+      canUseDomesticUsdt: domesticUsdt >= shortageUsdt,
+      canUseKrw: domesticUsdtKrw ? krw >= Math.max(0, shortageUsdt - domesticUsdt) * domesticUsdtKrw : false,
+      cappedByDailyLimit: plannedTopupUsdt < shortageUsdt
+    });
+  } else if (!bestKimchi) {
+    plans.push({
+      id: "NO_KIMCHI_PREMIUM_TOPUP",
+      severity: "info",
+      status: "WAITING_FOR_KIMCHI_PREMIUM",
+      title: "김프 진입용 해외 USDT 충전 대기",
+      reason: `국내가 해외보다 최소 ${formatPlain(state.settings.kimchiPremiumRebalanceTriggerPercent)}% 이상 비싼 김프가 아니면 해외 USDT 충전을 하지 않습니다.`,
+      preferredFlow: "김프 발생 시 국내 USDT 또는 KRW->USDT를 해외 거래소로 보내 해외 현물 매수 자금을 확보",
+      requiredChecks: ["김프 조건", "해외 USDT 부족", "일일 충전 한도", "API-only 입금 주소/출금망 확인", "수동 승인"]
+    });
+  }
+
+  const inverseKrwNeed = bestInverse ? Math.max(0, state.settings.orderNotionalUsdt * (domesticUsdtKrw || 0) - krw) : 0;
+  if (bestInverse && inverseKrwNeed > 0) {
+    const needUsdt = domesticUsdtKrw ? inverseKrwNeed / domesticUsdtKrw : null;
+    const cappedUsdt = Math.min(needUsdt ?? 0, remainingDailyWithdrawUsdt, foreignUsdt);
+    const cappedKrw = domesticUsdtKrw ? cappedUsdt * domesticUsdtKrw : 0;
+    plans.push({
+      id: "INVERSE_PREMIUM_KRW_PULL",
+      severity: "high",
+      status: state.settings.autoRebalanceEnabled ? "NEEDS_MANUAL_APPROVAL_BEFORE_LIVE" : "LOCKED_AUTO_REBALANCE_OFF",
+      title: "역프 대응 국내 KRW 확보",
+      reason: `${bestInverse.asset} 역프 ${formatPlain(bestInverse.premiumPercent)}% 감지 · 국내 매수용 KRW 부족 ${formatPlain(inverseKrwNeed)} KRW`,
+      preferredFlow: "해외 거래소 USDT를 일일 출금 한도 안에서 국내 거래소로 전송한 뒤 국내 USDT/KRW 매수호가에 매도하여 KRW를 확보하고, 그 KRW로 역프 대상 코인을 국내에서 매수",
+      requiredChecks: [
+        "역프가 설정 기준 이하인지 확인",
+        "해외 거래소 USDT 출금 네트워크",
+        "국내 거래소 USDT 입금 네트워크와 API 입금 주소",
+        "국내 USDT/KRW bid 호가 깊이와 슬리피지",
+        "USDT 출금 수수료와 국내 USDT 매도 수수료",
+        "일일 출금 한도 잔여분",
+        "ENABLE_AUTO_REBALANCE=true + 수동 승인"
+      ],
+      inverseAsset: bestInverse.asset,
+      inversePremiumPercent: bestInverse.premiumPercent,
+      estimatedNeedKrw: inverseKrwNeed,
+      estimatedNeedUsdt: needUsdt,
+      dailyWithdrawLimitUsdt: state.settings.dailyRebalanceWithdrawLimitUsdt,
+      todayWithdrawnUsdt: state.settings.todayRebalanceWithdrawnUsdt,
+      remainingDailyWithdrawUsdt,
+      plannedWithdrawUsdt: cappedUsdt,
+      plannedKrwAfterUsdtSale: cappedKrw,
+      canUseForeignUsdt: cappedUsdt > 0,
+      cappedByDailyLimit: needUsdt != null && cappedUsdt < needUsdt
+    });
+  } else if (!bestInverse) {
+    plans.push({
+      id: "NO_INVERSE_PREMIUM_PULL",
+      severity: "info",
+      status: "WAITING_FOR_INVERSE_PREMIUM",
+      title: "역프 대기",
+      reason: `해외가 국내보다 최소 ${formatPlain(state.settings.inversePremiumTriggerPercent)}% 이상 비싼 역프가 아니면 국내 KRW 확보용 해외 자금 회수를 하지 않습니다.`,
+      preferredFlow: "역프 발생 시에만 해외 USDT를 국내로 끌어와 KRW화",
+      requiredChecks: ["역프 조건", "일일 출금 한도", "API-only 입금 주소/출금망 확인", "수동 승인"]
+    });
+  }
+
+  if (!plans.length) {
+    const top = rows.find((row) => row.eligible);
+    plans.push({
+      id: "BALANCE_OK",
+      severity: "info",
+      status: "NO_REBALANCE_REQUIRED",
+      title: "리밸런싱 대기",
+      reason: top ? `${top.asset} 실행 후보 기준으로 모의 잔고가 최소 조건을 넘습니다.` : "현재 즉시 리밸런싱이 필요한 모의 잔고 부족은 없습니다.",
+      preferredFlow: "자동 자금 이동 없음",
+      requiredChecks: ["실거래 리밸런싱은 기본 비활성화", "필요 시 API-only 출금/입금 사전점검 후 수동 승인"]
+    });
+  }
+  return plans;
 }
 
 function comparableAssets(domesticExchange, foreignExchange) {
@@ -811,15 +978,22 @@ function bestTransferRouteEconomics(asset, fromExchange, toExchange, economics =
       message: "지원하지 않는 출발/도착 거래소 조합입니다."
     };
   }
-  const options = withdrawalNetworkOptions(sourceExchange, destinationExchange, asset)
+  const manualNetwork = manualNetworkOverride(asset, fromExchange, toExchange);
+  const allOptions = withdrawalNetworkOptions(sourceExchange, destinationExchange, asset);
+  const options = (manualNetwork
+    ? [manualWithdrawalOption(sourceExchange, destinationExchange, asset, manualNetwork, allOptions)]
+    : allOptions)
     .filter((option) => option.withdrawEnabled && option.depositEnabled)
     .sort((a, b) => a.withdrawFee - b.withdrawFee);
   if (!options.length) {
+    const dynamicRoute = dynamicTransferRouteEconomics(asset, fromExchange, toExchange, economics, manualNetwork);
+    if (dynamicRoute.hasConfiguredRoute) return dynamicRoute;
     return {
       ok: false,
       hasConfiguredRoute: false,
       sourceExchange,
       destinationExchange,
+      manualNetwork,
       message: "두 거래소가 동시에 지원하는 출금 네트워크와 수수료 정보를 찾지 못했습니다."
     };
   }
@@ -847,15 +1021,19 @@ function bestTransferRouteEconomics(asset, fromExchange, toExchange, economics =
   const receiveQuantity = quantity - best.withdrawFee;
   const grossBuyCostKrw = foreignBuy * quantity * usdtKrw;
   const grossSellProceedsKrw = domesticSell * Math.max(receiveQuantity, 0);
-  const feeBufferKrw = grossBuyCostKrw * state.settings.feeBufferPercent / 100;
-  const estimatedNetEdgeAfterTransferFeeKrw = grossSellProceedsKrw - grossBuyCostKrw - feeBufferKrw;
+  const buyTradingFeeKrw = grossBuyCostKrw * state.settings.feeBufferPercent / 100;
+  const shortEntryFeeKrw = grossBuyCostKrw * state.settings.feeBufferPercent / 100;
+  const sellTradingFeeKrw = grossSellProceedsKrw * state.settings.feeBufferPercent / 100;
+  const shortCloseFeeKrw = grossSellProceedsKrw * state.settings.feeBufferPercent / 100;
+  const estimatedTradingFeesKrw = buyTradingFeeKrw + shortEntryFeeKrw + sellTradingFeeKrw + shortCloseFeeKrw;
+  const estimatedNetEdgeAfterTransferFeeKrw = grossSellProceedsKrw - grossBuyCostKrw - estimatedTradingFeesKrw;
   const estimatedNetPremiumAfterTransferFeePercent = grossBuyCostKrw > 0
     ? (estimatedNetEdgeAfterTransferFeeKrw / grossBuyCostKrw) * 100
     : null;
   const messages = [];
   if (quantity < best.withdrawMin) messages.push(`출금 최소 수량 미달: ${formatPlain(quantity)} < ${formatPlain(best.withdrawMin)} ${asset}`);
   if (receiveQuantity <= 0) messages.push("출금 수수료 차감 후 수령 수량이 0 이하입니다.");
-  if (estimatedNetEdgeAfterTransferFeeKrw <= 0) messages.push("최저 출금 수수료를 반영하면 예상 차익이 0 이하입니다.");
+  if (estimatedNetEdgeAfterTransferFeeKrw <= 0) messages.push("출금 수수료와 매수/매도 거래 수수료를 모두 반영하면 예상 차익이 0 이하입니다.");
 
   return {
     ok: messages.length === 0,
@@ -863,6 +1041,7 @@ function bestTransferRouteEconomics(asset, fromExchange, toExchange, economics =
     sourceExchange,
     destinationExchange,
     bestNetwork: best.normalizedNetworkCode,
+    manualNetworkApplied: best.manualOverride === true,
     displayName: best.displayName,
     withdrawFee: best.withdrawFee,
     withdrawFeeKrw: best.withdrawFee * domesticSell,
@@ -873,11 +1052,128 @@ function bestTransferRouteEconomics(asset, fromExchange, toExchange, economics =
     estimatedReceiveQuantity: Math.max(receiveQuantity, 0),
     estimatedGrossBuyCostKrw: grossBuyCostKrw,
     estimatedGrossSellProceedsKrw: grossSellProceedsKrw,
-    estimatedFeeBufferKrw: feeBufferKrw,
+    estimatedFeeBufferKrw: estimatedTradingFeesKrw,
+    estimatedBuyTradingFeeKrw: buyTradingFeeKrw,
+    estimatedShortEntryFeeKrw: shortEntryFeeKrw,
+    estimatedSellTradingFeeKrw: sellTradingFeeKrw,
+    estimatedShortCloseFeeKrw: shortCloseFeeKrw,
     estimatedNetEdgeAfterTransferFeeKrw,
     estimatedNetPremiumAfterTransferFeePercent,
     candidateNetworks: options.map(transferOptionSummary),
-    message: messages.length ? messages.join(" / ") : "최저 출금 수수료 네트워크를 사용해도 예상 차익이 남습니다."
+    message: messages.length ? messages.join(" / ") : "공통 네트워크 중 최저 출금 수수료 경로와 매수/매도 거래 수수료를 반영해도 예상 차익이 남습니다."
+  };
+}
+
+function dynamicTransferRouteEconomics(asset, fromExchange, toExchange, economics = {}, manualNetwork = "") {
+  const from = state.depositWithdraw[fromExchange]?.[asset];
+  const to = state.depositWithdraw[toExchange]?.[asset];
+  if (!from || !to || from.withdrawEnabled !== true || to.depositEnabled !== true) {
+    return { ok: false, hasConfiguredRoute: false, message: "실시간 입출금 상태 캐시에 출금/입금 가능 정보가 부족합니다." };
+  }
+  const fromNetworks = (from.networks ?? []).map(normalizeNetwork).filter(Boolean);
+  const toNetworks = (to.networks ?? []).map(normalizeNetwork).filter(Boolean);
+  const common = manualNetwork
+    ? [manualNetwork]
+    : fromNetworks.filter((network) => toNetworks.includes(network) || toNetworks.includes("DEFAULT"));
+  if (!common.length) {
+    return {
+      ok: false,
+      hasConfiguredRoute: false,
+      withdrawEnabled: true,
+      depositEnabled: true,
+      candidateNetworks: fromNetworks.map((network) => ({ network, displayName: network, withdrawFee: null, withdrawEnabled: true, depositEnabled: false })),
+      message: "입출금은 가능하지만 공통 네트워크를 자동 확정하지 못했습니다. 수동 네트워크 입력 또는 TRANSFER_NETWORK_OVERRIDES가 필요합니다."
+    };
+  }
+  const candidates = common.map((network) => ({
+    network,
+    displayName: network,
+    withdrawFee: configuredWithdrawFee(fromExchange, asset, network),
+    withdrawMin: 0,
+    withdrawEnabled: true,
+    depositEnabled: true
+  })).sort((a, b) => a.withdrawFee - b.withdrawFee);
+  const best = candidates[0];
+  const quantity = Number(economics.quantity);
+  const domesticSell = Number(economics.domesticSell);
+  const foreignBuy = Number(economics.foreignBuy);
+  const usdtKrw = Number(economics.usdtKrw);
+  const receiveQuantity = Math.max(0, quantity - best.withdrawFee);
+  const grossBuyCostKrw = foreignBuy * quantity * usdtKrw;
+  const grossSellProceedsKrw = domesticSell * receiveQuantity;
+  const buyTradingFeeKrw = grossBuyCostKrw * state.settings.feeBufferPercent / 100;
+  const shortEntryFeeKrw = grossBuyCostKrw * state.settings.feeBufferPercent / 100;
+  const sellTradingFeeKrw = grossSellProceedsKrw * state.settings.feeBufferPercent / 100;
+  const shortCloseFeeKrw = grossSellProceedsKrw * state.settings.feeBufferPercent / 100;
+  const estimatedTradingFeesKrw = buyTradingFeeKrw + shortEntryFeeKrw + sellTradingFeeKrw + shortCloseFeeKrw;
+  const estimatedNetEdgeAfterTransferFeeKrw = grossSellProceedsKrw - grossBuyCostKrw - estimatedTradingFeesKrw;
+  const messages = [];
+  if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(grossBuyCostKrw)) messages.push("가격/수량 데이터가 부족해 출금 수수료 반영 손익을 계산하지 못했습니다.");
+  if (estimatedNetEdgeAfterTransferFeeKrw <= 0) messages.push("입출금 가능 네트워크와 매수/매도 거래 수수료를 반영하면 예상 차익이 0 이하입니다.");
+  return {
+    ok: messages.length === 0,
+    hasConfiguredRoute: true,
+    sourceExchange: displayWithdrawalSourceExchange(fromExchange),
+    destinationExchange: displayWithdrawalDestinationExchange(toExchange),
+    bestNetwork: best.network,
+    displayName: best.displayName,
+    withdrawFee: best.withdrawFee,
+    withdrawMin: best.withdrawMin,
+    withdrawEnabled: true,
+    depositEnabled: true,
+    estimatedSendQuantity: quantity,
+    estimatedReceiveQuantity: receiveQuantity,
+    estimatedGrossBuyCostKrw: grossBuyCostKrw,
+    estimatedGrossSellProceedsKrw: grossSellProceedsKrw,
+    estimatedFeeBufferKrw: estimatedTradingFeesKrw,
+    estimatedBuyTradingFeeKrw: buyTradingFeeKrw,
+    estimatedShortEntryFeeKrw: shortEntryFeeKrw,
+    estimatedSellTradingFeeKrw: sellTradingFeeKrw,
+    estimatedShortCloseFeeKrw: shortCloseFeeKrw,
+    estimatedNetEdgeAfterTransferFeeKrw,
+    candidateNetworks: candidates,
+    source: manualNetwork ? "MANUAL_NETWORK_OVERRIDE" : "EXCHANGE_STATUS_NETWORKS",
+    message: messages.length ? messages.join(" / ") : "실시간 입출금 상태의 공통 네트워크와 매수/매도 거래 수수료 기준으로 예상 차익이 남습니다."
+  };
+}
+
+function configuredWithdrawFee(fromExchange, asset, network) {
+  const key = `WITHDRAW_FEE_${String(fromExchange).toUpperCase()}_${asset}_${normalizeNetwork(network)}`;
+  const value = Number(process.env[key]);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function manualNetworkOverride(asset, fromExchange, toExchange) {
+  if (!process.env.TRANSFER_NETWORK_OVERRIDES) return "";
+  try {
+    const overrides = JSON.parse(process.env.TRANSFER_NETWORK_OVERRIDES);
+    const key = `${fromExchange}:${toExchange}:${asset}`;
+    return normalizeNetwork(overrides[key] ?? overrides[`${fromExchange}:${toExchange}:*`] ?? overrides[asset] ?? "");
+  } catch {
+    return "";
+  }
+}
+
+function manualWithdrawalOption(sourceExchange, destinationExchange, asset, network, knownOptions = []) {
+  const normalizedNetworkCode = normalizeNetwork(network);
+  const known = knownOptions.find((option) => option.normalizedNetworkCode === normalizedNetworkCode);
+  if (known) return { ...known, manualOverride: true };
+  return {
+    asset,
+    sourceExchange,
+    destinationExchange,
+    sourceNetworkCode: normalizedNetworkCode,
+    destinationNetworkCode: normalizedNetworkCode,
+    normalizedNetworkCode,
+    displayName: `수동 입력 네트워크 ${normalizedNetworkCode}`,
+    withdrawFee: Number(process.env.MANUAL_NETWORK_WITHDRAW_FEE || 0),
+    withdrawMin: Number(process.env.MANUAL_NETWORK_WITHDRAW_MIN || 0),
+    withdrawIntegerMultiple: Number(process.env.MANUAL_NETWORK_AMOUNT_STEP || 0.000001),
+    requiresTag: false,
+    depositEnabled: process.env.ALLOW_MANUAL_NETWORK_OVERRIDE === "true",
+    withdrawEnabled: process.env.ALLOW_MANUAL_NETWORK_OVERRIDE === "true",
+    manualOverride: true,
+    warning: "교집합 자동 인식 실패를 수동 네트워크로 우회했습니다. 실제 전송 전 주소/체인 재확인이 필요합니다."
   };
 }
 
@@ -938,6 +1234,7 @@ function getHedgeStatus(asset, foreignExchange, spotBuyPrice = null) {
   const listed = state.hedgeMarkets[foreignExchange]?.has(asset) === true;
   const futuresBid = quote?.bid;
   const depthUsdt = Number.isFinite((quote?.bidQty ?? 0) * (futuresBid ?? 0)) ? (quote?.bidQty ?? 0) * (futuresBid ?? 0) : 0;
+  const askDepthUsdt = Number.isFinite((quote?.askQty ?? 0) * (quote?.ask ?? 0)) ? (quote?.askQty ?? 0) * (quote?.ask ?? 0) : 0;
   const basisPercent = Number.isFinite(futuresBid) && Number.isFinite(spotBuyPrice) && spotBuyPrice > 0
     ? (futuresBid / spotBuyPrice - 1) * 100
     : null;
@@ -957,7 +1254,9 @@ function getHedgeStatus(asset, foreignExchange, spotBuyPrice = null) {
     futuresBid: futuresBid ?? null,
     futuresAsk: quote?.ask ?? null,
     bidQty: quote?.bidQty ?? null,
+    askQty: quote?.askQty ?? null,
     depthUsdt,
+    askDepthUsdt,
     basisPercent,
     source: quote ? "FUTURES_QUOTE_CACHE" : listed ? "FUTURES_MARKET_CACHE" : "UNKNOWN_OR_NOT_LISTED",
     ok,
@@ -985,6 +1284,10 @@ function dynamicMinPremium() {
   return Math.max(state.settings.minPremiumPercent, avg + Math.sqrt(variance));
 }
 
+function roundTripTradingFeePercent() {
+  return state.settings.feeBufferPercent * 4;
+}
+
 function evaluateRow(row) {
   const reasons = [];
   if (state.settings.emergencyStop) reasons.push("EMERGENCY_STOP");
@@ -997,10 +1300,12 @@ function evaluateRow(row) {
   if (row.transferStatus?.routeEconomics?.hasConfiguredRoute && row.transferStatus.routeEconomics.ok !== true) reasons.push("TRANSFER_FEE_UNPROFITABLE");
   if (state.settings.requireHedgeStatusForPaper && row.hedgeStatus?.ok !== true) reasons.push("HEDGE_STATUS_BLOCKED");
   if (hasStale(row)) reasons.push("STALE_DATA");
-  if (row.slippagePercent > state.settings.maxSlippagePercent) reasons.push("SLIPPAGE_TOO_HIGH");
+  if (!row.entryPlan?.ok && row.slippagePercent > state.settings.maxSlippagePercent) reasons.push("SLIPPAGE_TOO_HIGH");
+  if (!row.entryPlan?.ok && [row.domesticFill, row.foreignFill, row.usdtFill].some((fill) => fill?.breachesLimit)) reasons.push("ORDERBOOK_PRICE_LEVEL_SLIPPAGE_LIMIT");
   if (row.availableDepthUsdt < state.settings.minDepthUsdt) reasons.push("ORDERBOOK_DEPTH_TOO_LOW");
-  if (state.simulatedBalances.USDT < state.settings.orderNotionalUsdt) reasons.push("FOREIGN_USDT_BALANCE_LOW");
-  if (state.simulatedBalances.marginUsdt < state.settings.orderNotionalUsdt * 0.15) reasons.push("FUTURES_MARGIN_LOW");
+  if (row.entryPlan && row.entryPlan.executableUsdt < MIN_GLOBAL_ORDER_USDT) reasons.push("ENTRY_CHUNK_BELOW_MIN_ORDER");
+  if (state.simulatedBalances.USDT < MIN_GLOBAL_ORDER_USDT) reasons.push("FOREIGN_USDT_BALANCE_LOW");
+  if (state.simulatedBalances.marginUsdt < Math.max(MIN_GLOBAL_ORDER_USDT, row.entryPlan?.executableUsdt ?? 0) * 0.15) reasons.push("FUTURES_MARGIN_LOW");
   if (state.simulatedBalances.realizedPnlKrw <= -Math.abs(state.settings.dailyLossLimitKrw)) reasons.push("DAILY_LOSS_LIMIT");
   return {
     approved: reasons.length === 0,
@@ -1015,10 +1320,12 @@ function effectivePrice(levels = [], side, quantity, referencePrice) {
   let remaining = quantity;
   let notional = 0;
   let filled = 0;
+  let lastPrice = null;
   for (const level of levels) {
     const take = Math.min(remaining, level.qty);
     notional += take * level.price;
     filled += take;
+    if (take > 0) lastPrice = level.price;
     remaining -= take;
     if (remaining <= 1e-12) break;
   }
@@ -1027,7 +1334,84 @@ function effectivePrice(levels = [], side, quantity, referencePrice) {
   const slippagePercent = side === "buy"
     ? Math.max(0, avgPrice / referencePrice - 1) * 100
     : Math.max(0, 1 - avgPrice / referencePrice) * 100;
-  return { avgPrice, filledQty: filled, fillRatio: Math.min(1, filled / quantity), slippagePercent };
+  const allowedSlippage = state.settings.maxSlippagePercent / 100;
+  const worstAllowedPrice = side === "buy"
+    ? referencePrice * (1 + allowedSlippage)
+    : referencePrice * (1 - allowedSlippage);
+  const breachesLimit = side === "buy"
+    ? Number.isFinite(lastPrice) && lastPrice > worstAllowedPrice
+    : Number.isFinite(lastPrice) && lastPrice < worstAllowedPrice;
+  return {
+    avgPrice,
+    filledQty: filled,
+    fillRatio: Math.min(1, filled / quantity),
+    slippagePercent,
+    lastPrice,
+    worstAllowedPrice,
+    breachesLimit,
+    limitRule: side === "buy"
+      ? "buy uses asks; last fill price must be <= best ask * (1 + max slippage)"
+      : "sell uses bids; last fill price must be >= best bid * (1 - max slippage)"
+  };
+}
+
+function orderbookCapacityWithinSlippage(levels = [], side, referencePrice, maxQuantity = Infinity) {
+  if (!Number.isFinite(referencePrice) || referencePrice <= 0 || maxQuantity <= 0) {
+    return { quantity: 0, notional: 0, avgPrice: null, lastPrice: null, worstAllowedPrice: null, ok: false };
+  }
+  const allowedSlippage = state.settings.maxSlippagePercent / 100;
+  const worstAllowedPrice = side === "buy"
+    ? referencePrice * (1 + allowedSlippage)
+    : referencePrice * (1 - allowedSlippage);
+  let remaining = maxQuantity;
+  let quantity = 0;
+  let notional = 0;
+  let lastPrice = null;
+  for (const level of levels) {
+    const inRange = side === "buy" ? level.price <= worstAllowedPrice : level.price >= worstAllowedPrice;
+    if (!inRange) break;
+    const take = Math.min(remaining, level.qty);
+    if (take <= 0) continue;
+    quantity += take;
+    notional += take * level.price;
+    lastPrice = level.price;
+    remaining -= take;
+    if (remaining <= 1e-12) break;
+  }
+  return {
+    quantity,
+    notional,
+    avgPrice: quantity > 0 ? notional / quantity : null,
+    lastPrice,
+    worstAllowedPrice,
+    ok: quantity > 0
+  };
+}
+
+function buildEntryPlan(row, foreignBook, completedUsdt = 0, remainingTargetUsdt = state.settings.orderNotionalUsdt) {
+  const spotCapacity = orderbookCapacityWithinSlippage(foreignBook?.asks ?? [], "buy", row.foreignAsk, Infinity);
+  const shortDepthUsdt = row.hedgeStatus?.ok ? Number(row.hedgeStatus.depthUsdt || 0) : 0;
+  const allowedUsdt = Math.max(0, Math.min(remainingTargetUsdt, spotCapacity.notional, shortDepthUsdt));
+  const executableUsdt = allowedUsdt >= MIN_GLOBAL_ORDER_USDT ? allowedUsdt : 0;
+  const quantity = row.foreignAsk > 0 ? executableUsdt / row.foreignAsk : 0;
+  return {
+    key: `${row.asset}:${row.domesticExchange}:${row.foreignExchange}`,
+    targetUsdt: state.settings.orderNotionalUsdt,
+    completedUsdt,
+    remainingTargetUsdt,
+    executableUsdt,
+    executableKrw: executableUsdt * (row.usdtKrw || 0),
+    executableQuantity: quantity,
+    spotBuyCapacityUsdt: spotCapacity.notional,
+    shortEntryCapacityUsdt: shortDepthUsdt,
+    spotLastPrice: spotCapacity.lastPrice,
+    spotWorstAllowedPrice: spotCapacity.worstAllowedPrice,
+    cadenceMs: TRADE_COOLDOWN_MS,
+    ok: executableUsdt >= MIN_GLOBAL_ORDER_USDT,
+    message: executableUsdt >= MIN_GLOBAL_ORDER_USDT
+      ? "허용 슬리피지 안에서 현물 매수 가능 금액과 숏 진입 가능 금액 중 작은 금액만 이번 회차 실행"
+      : "허용 슬리피지/헷지 깊이 기준으로 이번 회차 최소 주문금액을 만족하지 못해 대기"
+  };
 }
 
 function estimateFillProbability(domesticBook, foreignBook, quantity) {
@@ -1103,6 +1487,9 @@ function updateSettings(params) {
   if (params.has("minHedgeDepthUsdt")) {
     state.settings.minHedgeDepthUsdt = clamp(Number(params.get("minHedgeDepthUsdt")), 0, 1_000_000);
   }
+  if (params.has("maxLeverage")) {
+    state.settings.maxLeverage = clamp(Number(params.get("maxLeverage")), 1, 4);
+  }
   state.settings.liveTrading = state.settings.liveTradingRequested && isLiveArmed();
   state.settings.withdrawalEnabled = false;
   state.settings.autoRebalanceEnabled = false;
@@ -1156,29 +1543,72 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-function autoPaperTrade() {
+async function autoPaperTrade() {
   if (!state.settings.autoPaperTrading || state.settings.emergencyStop) return;
   const now = Date.now();
   const eligible = buildRows().filter(isEligible);
   for (const row of eligible.slice(0, 5)) {
     const key = `${row.asset}:${row.domesticExchange}:${row.foreignExchange}`;
     if (now - (state.lastTradeAt[key] || 0) < TRADE_COOLDOWN_MS) continue;
+    const executeUsdt = Math.min(row.entryPlan?.executableUsdt ?? 0, state.simulatedBalances.USDT);
+    if (executeUsdt < MIN_GLOBAL_ORDER_USDT) continue;
+    const quantity = executeUsdt / row.foreignAsk;
+    let preflight = null;
+    if (state.settings.requireApiExecutionPreflight) {
+      preflight = await executionPreflight({
+        asset: row.asset,
+        sourceExchange: row.foreignExchange,
+        destinationExchange: row.domesticExchange,
+        amount: quantity
+      });
+      if (!preflight.canExecute) {
+        state.lastTradeAt[key] = now;
+        addRiskEvent("AUTO_TRADE_PREFLIGHT_BLOCKED", "high", `거래 시작 전 API-only 입출금/주소/수수료 점검 실패: ${preflight.blockedBy || "UNKNOWN"}`, {
+          asset: row.asset,
+          sourceExchange: row.foreignExchange,
+          destinationExchange: row.domesticExchange,
+          messages: preflight.messages
+        });
+        continue;
+      }
+    }
     state.lastTradeAt[key] = now;
-    const quantity = state.settings.orderNotionalUsdt / row.foreignAsk;
-    const partialFillRatio = Math.min(row.domesticFill?.fillRatio ?? 0, row.foreignFill?.fillRatio ?? 0, row.usdtFill?.fillRatio ?? 1);
-    const filledQuantity = quantity * partialFillRatio;
-    const unhedgedQuantity = Math.max(0, quantity - filledQuantity);
+    const partialFillRatio = 1;
+    const filledQuantity = quantity;
+    const unhedgedQuantity = 0;
     const foreignConvertedKrw = row.foreignEffectiveBuyPrice * row.usdtKrw;
     const effectiveDomesticSellKrw = row.domesticEffectiveSellPrice ?? row.domesticBid;
     const filledForeignNotionalUsdt = row.foreignEffectiveBuyPrice * filledQuantity;
     const filledForeignNotionalKrw = foreignConvertedKrw * filledQuantity;
     const estimatedGrossEdgeKrw = (effectiveDomesticSellKrw - foreignConvertedKrw) * filledQuantity;
-    const estimatedFeeBufferKrw = filledForeignNotionalKrw * state.settings.feeBufferPercent / 100;
+    const expectedDomesticProceedsKrw = effectiveDomesticSellKrw * filledQuantity;
+    const estimatedBuyTradingFeeKrw = filledForeignNotionalKrw * state.settings.feeBufferPercent / 100;
+    const estimatedShortEntryFeeKrw = filledForeignNotionalKrw * state.settings.feeBufferPercent / 100;
+    const estimatedSellTradingFeeKrw = expectedDomesticProceedsKrw * state.settings.feeBufferPercent / 100;
+    const estimatedShortCloseFeeKrw = expectedDomesticProceedsKrw * state.settings.feeBufferPercent / 100;
+    const estimatedFeeBufferKrw = estimatedBuyTradingFeeKrw + estimatedShortEntryFeeKrw + estimatedSellTradingFeeKrw + estimatedShortCloseFeeKrw;
     const estimatedNetEdgeKrw = estimatedGrossEdgeKrw - estimatedFeeBufferKrw;
     const mmSellPlan = buildMmSellPlan(row);
     state.simulatedBalances.USDT -= filledForeignNotionalUsdt;
     state.simulatedBalances.lockedUsdt += filledForeignNotionalUsdt;
     state.simulatedBalances.unrealizedPnlKrw += estimatedNetEdgeKrw;
+    const plan = state.entryPlans[key] ?? {
+      key,
+      asset: row.asset,
+      domesticExchange: row.domesticExchange,
+      foreignExchange: row.foreignExchange,
+      targetUsdt: state.settings.orderNotionalUsdt,
+      completedUsdt: 0,
+      chunks: [],
+      status: "RUNNING"
+    };
+    plan.completedUsdt += filledForeignNotionalUsdt;
+    plan.remainingUsdt = Math.max(0, plan.targetUsdt - plan.completedUsdt);
+    plan.status = plan.remainingUsdt < MIN_GLOBAL_ORDER_USDT ? "TARGET_REACHED" : "WAITING_NEXT_15S_CHUNK";
+    plan.updatedAt = new Date(now).toISOString();
+    plan.chunks.unshift({ at: plan.updatedAt, usdt: filledForeignNotionalUsdt, quantity: filledQuantity, hedgeExchange: row.hedgeStatus.exchange });
+    plan.chunks = plan.chunks.slice(0, 20);
+    state.entryPlans[key] = plan;
     const trade = {
       id: `${now}-${key}`,
       mode: "PAPER_ONLY",
@@ -1192,8 +1622,19 @@ function autoPaperTrade() {
       filledQuantity,
       partialFillRatio,
       unhedgedQuantity,
-      orderNotionalUsdt: state.settings.orderNotionalUsdt,
+      orderNotionalUsdt: executeUsdt,
+      targetOrderNotionalUsdt: state.settings.orderNotionalUsdt,
+      entryPlan: {
+        key,
+        chunkUsdt: executeUsdt,
+        completedUsdt: plan.completedUsdt,
+        remainingUsdt: plan.remainingUsdt,
+        spotBuyCapacityUsdt: row.entryPlan.spotBuyCapacityUsdt,
+        shortEntryCapacityUsdt: row.entryPlan.shortEntryCapacityUsdt,
+        rule: "spot buy amount and short notional are matched by the smaller executable notional inside max slippage"
+      },
       riskDecision: row.risk,
+      executionPreflight: preflight,
       mmSellPlan,
       legs: [
         {
@@ -1202,15 +1643,18 @@ function autoPaperTrade() {
           symbol: `${row.asset}/USDT`,
           price: row.foreignAsk,
           quantity,
-          filledQuantity
+          filledQuantity,
+          notionalUsdt: executeUsdt
         },
         {
           action: "SHORT_PERP",
-          exchange: row.foreignExchange,
+          exchange: row.hedgeStatus.exchange || row.foreignExchange,
           symbol: `${row.asset}/USDT:PERP`,
-          price: row.foreignAsk,
+          price: row.hedgeStatus.futuresBid || row.foreignAsk,
           quantity,
-          filledQuantity
+          filledQuantity,
+          notionalUsdt: executeUsdt,
+          reduceOnly: false
         },
         {
           action: "MM_SELL_ONLY_LADDER_PLAN",
@@ -1233,6 +1677,10 @@ function autoPaperTrade() {
       filledForeignNotionalUsdt,
       estimatedGrossEdgeKrw,
       estimatedFeeBufferKrw,
+      estimatedBuyTradingFeeKrw,
+      estimatedShortEntryFeeKrw,
+      estimatedSellTradingFeeKrw,
+      estimatedShortCloseFeeKrw,
       estimatedNetEdgeKrw,
       slippagePercent: row.slippagePercent,
       fillProbability: row.fillProbability,
@@ -1241,7 +1689,7 @@ function autoPaperTrade() {
     };
     state.paperTrades.unshift(trade);
     createTransferPosition(trade, row);
-    addBotEvent("PAPER_TRADE_CREATED", `${row.asset} ${row.domesticExchange}/${row.foreignExchange} 모의거래 기록`, { premiumPercent: row.premiumPercent, netPremiumPercent: row.netPremiumPercent });
+    addBotEvent("PAPER_TRADE_CREATED", `${row.asset} ${row.domesticExchange}/${row.foreignExchange} ${formatPlain(executeUsdt)} USDT 분할 모의거래 기록`, { premiumPercent: row.premiumPercent, netPremiumPercent: row.netPremiumPercent, entryPlan: plan.status });
     if (unhedgedQuantity > 0) addRiskEvent("UNHEDGED_SIMULATED", "warning", "부분체결 또는 미헷지 가능성이 감지되었습니다.", { key, unhedgedQuantity });
     state.paperTrades = state.paperTrades.slice(0, 300);
   }
@@ -1266,10 +1714,16 @@ function createTransferPosition(trade, row) {
     startedPremiumPercent: trade.premiumPercent,
     startedNetPremiumPercent: trade.netPremiumPercent,
     currentPremiumPercent: row.premiumPercent,
-    currentNetPremiumPercent: row.netPremiumPercent,
-    targetNetPremiumPercent: dynamicMinPremium(),
-    transferStatus: row.transferStatus,
-    hedgeStatus: row.hedgeStatus,
+	    currentNetPremiumPercent: row.netPremiumPercent,
+	    targetNetPremiumPercent: dynamicMinPremium(),
+	    transferStatus: row.transferStatus,
+	    executionPreflight: trade.executionPreflight,
+	    selectedTransferNetwork: trade.executionPreflight?.selectedNetwork?.normalizedNetworkCode || row.transferStatus?.routeEconomics?.bestNetwork || "",
+	    apiDepositAddressSource: trade.executionPreflight?.address?.source || "",
+	    transferFeeKrw: trade.executionPreflight?.selectedNetwork?.withdrawFeeKnown
+	      ? (trade.executionPreflight.selectedNetwork.withdrawFee * row.domesticBid)
+	      : (row.transferStatus?.routeEconomics?.withdrawFeeKrw ?? 0),
+	    hedgeStatus: row.hedgeStatus,
     status: "IN_TRANSIT",
     statusMessage: "해외 매수 시점부터 국내 입금까지 프리미엄 감시 중",
     startedAt: new Date(startedAtMs).toISOString(),
@@ -1392,7 +1846,8 @@ function startExitPosition(position, row, route) {
   const shortEntryQuantity = Math.max(0, Number(position.quantity || targetQuantity));
   const currentPremiumPercent = row?.premiumPercent ?? position.currentPremiumPercent ?? null;
   const currentNetPremiumPercent = row?.netPremiumPercent ?? position.currentNetPremiumPercent ?? null;
-  const blocked = currentNetPremiumPercent != null && currentNetPremiumPercent < dynamicMinPremium() && route === "domestic";
+  const exitDecision = row ? exitPremiumDecision(position, row, targetQuantity) : { canSell: route !== "domestic", reason: "ORIGIN_EXIT" };
+  const blocked = route === "domestic" && !exitDecision.canSell;
   const now = new Date().toISOString();
   const exit = {
     id: `exit-${position.id}`,
@@ -1421,6 +1876,8 @@ function startExitPosition(position, row, route) {
     tolerancePercent: state.settings.shortCloseTolerancePercent,
     currentPremiumPercent,
     currentNetPremiumPercent,
+    exitDecision,
+    transferFeeKrw: position.transferFeeKrw ?? 0,
     minPremiumPercent: dynamicMinPremium(),
     stages: {
       deposit: "completed",
@@ -1450,13 +1907,17 @@ function processExitPositions() {
     exit.currentPremiumPercent = row?.premiumPercent ?? exit.currentPremiumPercent;
     exit.currentNetPremiumPercent = row?.netPremiumPercent ?? exit.currentNetPremiumPercent;
     exit.minPremiumPercent = dynamicMinPremium();
+    const decision = row ? exitPremiumDecision(exit, row, exit.remainingSpotQuantity || exit.targetSpotSellQuantity) : { canSell: exit.route !== "domestic", reason: "ORIGIN_EXIT" };
+    exit.exitDecision = decision;
     if (exit.status === "WAITING_PREMIUM") {
-      if ((exit.currentNetPremiumPercent ?? -Infinity) >= exit.minPremiumPercent && row && !hasStale(row)) {
+      if (decision.canSell && row && !hasStale(row)) {
         exit.status = "SELLING_SPOT";
-        exit.statusMessage = "프리미엄 재진입 · 현물 매도 진행 중";
-        exit.stages.premiumRecheck = "completed";
+        exit.statusMessage = decision.reason === "MIN_PREMIUM_MET"
+          ? "프리미엄 재진입 · 현물 매도 진행 중"
+          : "최소 프리미엄 미달이지만 수수료 포함 손익이 음수가 아니어서 현물 매도 진행";
+        exit.stages.premiumRecheck = decision.reason === "MIN_PREMIUM_MET" ? "completed" : "non-loss-exit";
         exit.stages.spotSell = "running";
-        pushExitEvent(exit, "프리미엄 기준 재통과, 현물 매도 재개");
+        pushExitEvent(exit, decision.message);
       }
       continue;
     }
@@ -1472,10 +1933,31 @@ function simulateSpotSellAndShortClose(exit, row) {
     pushExitEvent(exit, "매도 기준 가격 데이터가 없어 수동 매도 필요");
     return;
   }
+  const decision = row ? exitPremiumDecision(exit, row, exit.remainingSpotQuantity || exit.targetSpotSellQuantity) : { canSell: exit.route !== "domestic", reason: "ORIGIN_EXIT" };
+  exit.exitDecision = decision;
+  if (exit.route === "domestic" && (!decision.canSell || hasStale(row))) {
+    exit.status = "WAITING_PREMIUM";
+    exit.statusMessage = hasStale(row)
+      ? "매도 직전 데이터 stale · 15초 뒤 재확인"
+      : "매도 직전 최소 프리미엄 미달이고 수수료 포함 손익도 음수 · 15초 뒤 재확인";
+    exit.stages.premiumRecheck = "blocked";
+    pushExitEvent(exit, decision.message || "프리미엄/손익 조건 미달로 현물 매도와 숏 청산 보류");
+    return;
+  }
   const remaining = Math.max(0, exit.targetSpotSellQuantity - exit.cumulativeSpotSoldQuantity);
   if (remaining <= 1e-12) return completeExitIfDone(exit, row);
-  const ratio = exit.fills.length === 0 ? 0.3 : exit.fills.length === 1 ? 0.4 : 1;
-  const spotFillQuantity = Math.min(remaining, exit.targetSpotSellQuantity * ratio);
+  const safeSpotQuantity = exit.route === "domestic"
+    ? Math.max(0, row?.exitLiquidity?.spotSellSafeQuantity ?? 0)
+    : remaining;
+  const safeShortCloseQuantity = Math.max(0, row?.exitLiquidity?.shortCloseSafeQuantity ?? remaining);
+  const spotFillQuantity = Math.min(remaining, safeSpotQuantity, safeShortCloseQuantity);
+  const spotNotionalKrw = spotFillQuantity * (row?.domesticBid || 0);
+  if (spotFillQuantity <= 1e-12 || spotNotionalKrw < MIN_DOMESTIC_ORDER_KRW) {
+    exit.status = "WAITING_PREMIUM";
+    exit.statusMessage = "허용 슬리피지 안의 현물 매도/숏 청산 가능 수량이 최소 주문 조건 미달 · 15초 뒤 재확인";
+    pushExitEvent(exit, "현물 매도 가능 수량과 숏 청산 가능 수량 중 작은 값이 부족해 대기");
+    return;
+  }
   const spotPrice = row?.domesticEffectiveSellPrice || row?.domesticBid || 0;
   const shortCloseQuantity = shortCloseQuantityForFill(exit, spotFillQuantity);
   const shortClosePrice = row?.hedgeStatus?.futuresAsk || row?.foreignAsk || 0;
@@ -1497,7 +1979,8 @@ function simulateSpotSellAndShortClose(exit, row) {
     side: "BUY_REDUCE_ONLY",
     quantity: shortCloseQuantity,
     price: shortClosePrice,
-    formula: "shortEntryQuantity * spotFillQuantity / targetSpotSellQuantity"
+    formula: "shortEntryQuantity * spotFillQuantity / targetSpotSellQuantity",
+    safety: "spot sell fill must be confirmed before this reduce-only close is counted"
   });
   exit.cumulativeSpotSoldQuantity += spotFillQuantity;
   exit.cumulativeShortClosedQuantity += shortCloseQuantity;
@@ -1506,7 +1989,7 @@ function simulateSpotSellAndShortClose(exit, row) {
   exit.stages.spotSell = exit.remainingSpotQuantity <= 1e-12 ? "completed" : "running";
   exit.stages.shortClose = exit.remainingShortQuantity <= toleranceQuantity(exit) ? "completed" : "running";
   exit.statusMessage = `현물 누적 ${formatPlain(exit.cumulativeSpotSoldQuantity)} / 목표 ${formatPlain(exit.targetSpotSellQuantity)} · 숏 누적 ${formatPlain(exit.cumulativeShortClosedQuantity)} / 진입 ${formatPlain(exit.shortEntryQuantity)}`;
-  pushExitEvent(exit, `현물 ${formatPlain(spotFillQuantity)} 체결 감지 → 숏 ${formatPlain(shortCloseQuantity)} reduce-only 청산`);
+  pushExitEvent(exit, `허용 슬리피지 안에서 현물 ${formatPlain(spotFillQuantity)} 체결 감지 → 숏 ${formatPlain(shortCloseQuantity)} reduce-only 청산`);
   completeExitIfDone(exit, row);
 }
 
@@ -1521,22 +2004,69 @@ function shortCloseQuantityForFill(exit, spotFillQuantity) {
   return proportional;
 }
 
+function exitPremiumDecision(positionOrExit, row, quantity) {
+  const netPremiumPercent = row?.netPremiumPercent ?? -Infinity;
+  const minPremiumPercent = dynamicMinPremium();
+  if (netPremiumPercent >= minPremiumPercent) {
+    return {
+      canSell: true,
+      reason: "MIN_PREMIUM_MET",
+      netPremiumPercent,
+      minPremiumPercent,
+      estimatedExitPnlKrw: null,
+      message: "매도 직전 최소 프리미엄을 통과했습니다."
+    };
+  }
+  const trade = state.paperTrades.find((item) => item.id === positionOrExit.tradeId);
+  const safeQuantity = Math.max(0, Number(quantity || 0));
+  const buyUnitKrw = trade?.filledQuantity > 0
+    ? (trade.filledForeignNotionalKrw || 0) / trade.filledQuantity
+    : (row?.foreignEffectiveBuyPrice || row?.foreignAsk || 0) * (row?.usdtKrw || 0);
+  const sellUnitKrw = row?.domesticEffectiveSellPrice || row?.domesticBid || 0;
+  const buyCostKrw = buyUnitKrw * safeQuantity;
+  const sellProceedsKrw = sellUnitKrw * safeQuantity;
+  const buyTradingFeeKrw = buyCostKrw * state.settings.feeBufferPercent / 100;
+  const shortEntryFeeKrw = buyCostKrw * state.settings.feeBufferPercent / 100;
+  const sellTradingFeeKrw = sellProceedsKrw * state.settings.feeBufferPercent / 100;
+  const shortCloseFeeKrw = sellProceedsKrw * state.settings.feeBufferPercent / 100;
+  const transferFeeKrw = Number(positionOrExit.transferFeeKrw || 0);
+  const estimatedExitPnlKrw = sellProceedsKrw - buyCostKrw - buyTradingFeeKrw - shortEntryFeeKrw - sellTradingFeeKrw - shortCloseFeeKrw - transferFeeKrw;
+  return {
+    canSell: estimatedExitPnlKrw >= 0,
+    reason: estimatedExitPnlKrw >= 0 ? "NON_LOSS_EXIT_ALLOWED" : "NEGATIVE_AFTER_FEES_WAIT",
+    netPremiumPercent,
+    minPremiumPercent,
+    buyCostKrw,
+    sellProceedsKrw,
+    buyTradingFeeKrw,
+    shortEntryFeeKrw,
+    sellTradingFeeKrw,
+    shortCloseFeeKrw,
+    transferFeeKrw,
+    estimatedExitPnlKrw,
+    message: estimatedExitPnlKrw >= 0
+      ? "최소 프리미엄은 미달이지만 매수/매도 수수료와 송금비 반영 후 손해가 아니므로 매도를 허용합니다."
+      : "최소 프리미엄 미달이며 매수/매도 수수료와 송금비 반영 후 손익이 음수라 대기합니다."
+  };
+}
+
 function toleranceQuantity(exit) {
   return exit.shortEntryQuantity * (exit.tolerancePercent || 1) / 100;
 }
 
 function completeExitIfDone(exit, row) {
-  if (exit.remainingSpotQuantity > 1e-12 || exit.remainingShortQuantity > toleranceQuantity(exit)) return;
+  if (exit.remainingSpotQuantity > 1e-12) return;
   if (exit.remainingShortQuantity > 0) {
     const finalClose = exit.remainingShortQuantity;
     exit.shortCloses.push({
       at: new Date().toISOString(),
-      type: "SHORT_CLOSE_TOLERANCE_FINAL_SIMULATED",
+      type: "SHORT_CLOSE_FINAL_REMAINDER_SIMULATED",
       exchange: exit.shortExchange,
       symbol: exit.futuresSymbol,
       side: "BUY_REDUCE_ONLY",
       quantity: finalClose,
-      price: row?.hedgeStatus?.futuresAsk || row?.foreignAsk || 0
+      price: row?.hedgeStatus?.futuresAsk || row?.foreignAsk || 0,
+      reason: "spot exit completed; close every remaining short quantity"
     });
     exit.cumulativeShortClosedQuantity += finalClose;
     exit.remainingShortQuantity = 0;
@@ -1566,7 +2096,7 @@ function createSettlement(exit, row) {
   const shortEntryValue = (trade?.foreignEffectiveBuyPrice || trade?.referenceExit?.foreignEffectiveBuyUsdt || row?.foreignAsk || 0) * exit.shortEntryQuantity * usdtKrw;
   const shortCloseValue = exit.shortCloses.reduce((sum, fill) => sum + (fill.price || 0) * fill.quantity * usdtKrw, 0);
   const spotFeeKrw = (spotBuyKrw + spotSellKrw) * state.settings.feeBufferPercent / 100;
-  const futuresFeeKrw = (shortEntryValue + shortCloseValue) * 0.0006;
+  const futuresFeeKrw = (shortEntryValue + shortCloseValue) * state.settings.feeBufferPercent / 100;
   const transferFeeKrw = exit.transferFeeKrw || 0;
   const spotPnlKrw = spotSellKrw - spotBuyKrw - spotFeeKrw - transferFeeKrw;
   const futuresPnlKrw = shortEntryValue - shortCloseValue - futuresFeeKrw;
@@ -1793,7 +2323,8 @@ function buildLiveReadiness() {
     withdrawalEnabled: false,
     autoRebalanceEnabled: false,
     realTransferStatusConfirmed: process.env.REAL_TRANSFER_STATUS_CONFIRMED === "true",
-    maxOrderNotionalUsdt: state.settings.liveMaxOrderNotionalUsdt
+    maxOrderNotionalUsdt: state.settings.liveMaxOrderNotionalUsdt,
+    maxLeverage: state.settings.maxLeverage
   };
   return state.live.readiness;
 }
@@ -1870,8 +2401,9 @@ function debugRoute(params) {
     item.foreignExchange === fromExchange &&
     item.domesticExchange === toExchange
   );
-  const transferStatus = getTransferStatus(asset, fromExchange, toExchange);
+  const transferStatus = row?.transferStatus ?? getTransferStatus(asset, fromExchange, toExchange);
   const hedgeStatus = row ? row.hedgeStatus : chooseHedgeVenue(asset, state.foreign[fromExchange]?.[asset]?.ask);
+  const hedgeCandidates = FOREIGN.map((exchange) => getHedgeStatus(asset, exchange, state.foreign[fromExchange]?.[asset]?.ask));
   return {
     ok: true,
     asset,
@@ -1889,6 +2421,7 @@ function debugRoute(params) {
     } : null,
     transferStatus,
     hedgeStatus,
+    hedgeCandidates,
     verdict: {
       transferRequired: state.settings.requireTransferStatusForPaper,
       hedgeRequired: state.settings.requireHedgeStatusForPaper,
@@ -1921,13 +2454,219 @@ function withdrawalOptions() {
   };
 }
 
+async function executionPreflight(payload) {
+  const asset = cleanAsset(payload.asset);
+  const sourceExchange = normalizeRuntimeExchange(payload.sourceExchange || payload.buyExchange || payload.foreignExchange);
+  const destinationExchange = normalizeRuntimeExchange(payload.destinationExchange || payload.sellExchange || payload.domesticExchange);
+  const manualNetwork = normalizeNetwork(payload.manualNetwork || payload.network || "");
+  const amount = Number(payload.amount ?? payload.quantity ?? 0);
+  const messages = [];
+  if (!asset) messages.push("ASSET_REQUIRED");
+  if (!sourceExchange) messages.push("SOURCE_EXCHANGE_REQUIRED");
+  if (!destinationExchange) messages.push("DESTINATION_EXCHANGE_REQUIRED");
+  if (sourceExchange && destinationExchange && sourceExchange === destinationExchange) messages.push("SOURCE_DESTINATION_SAME");
+  if (messages.length) return { ok: true, canExecute: false, blockedBy: "INVALID_PREFLIGHT_INPUT", messages };
+
+  const result = {
+    ok: true,
+    canExecute: false,
+    mode: "API_ONLY_EXECUTION_PREFLIGHT",
+    asset,
+    sourceExchange,
+    destinationExchange,
+    amount: Number.isFinite(amount) ? amount : 0,
+    manualNetwork: manualNetwork || "",
+    source: null,
+    destination: null,
+    commonNetworks: [],
+    selectedNetwork: null,
+    address: null,
+    messages: []
+  };
+
+  const startedAt = Date.now();
+  const [source, destination] = await Promise.allSettled([
+    cachedApiCapability("withdraw", sourceExchange, asset, () => apiWithdrawalCapabilities(sourceExchange, asset)),
+    cachedApiCapability("deposit", destinationExchange, asset, () => apiDepositCapabilities(destinationExchange, asset))
+  ]);
+  result.source = source.status === "fulfilled" ? source.value : apiCapabilityError(source.reason, sourceExchange, asset, "withdraw");
+  result.destination = destination.status === "fulfilled" ? destination.value : apiCapabilityError(destination.reason, destinationExchange, asset, "deposit");
+
+  if (!result.source.ok) result.messages.push(`출발 거래소 API 출금 네트워크 확인 실패: ${result.source.error}`);
+  if (!result.destination.ok) result.messages.push(`도착 거래소 API 입금 네트워크/주소 확인 실패: ${result.destination.error}`);
+  if (!result.source.ok || !result.destination.ok) {
+    result.blockedBy = "API_NETWORK_OR_ADDRESS_CHECK_FAILED";
+    addRiskEvent("EXECUTION_PREFLIGHT_BLOCKED", "high", result.messages.join(" · "), { asset, sourceExchange, destinationExchange });
+    return result;
+  }
+
+  const sourceNetworks = result.source.networks.filter((item) => item.withdrawEnabled);
+  const destinationNetworks = result.destination.networks.filter((item) => item.depositEnabled && item.address);
+  const destinationByNetwork = new Map(destinationNetworks.map((item) => [item.normalizedNetworkCode, item]));
+  const common = sourceNetworks
+    .filter((item) => destinationByNetwork.has(item.normalizedNetworkCode))
+    .map((item) => ({
+      ...item,
+      destinationNetworkCode: destinationByNetwork.get(item.normalizedNetworkCode).networkCode,
+      address: destinationByNetwork.get(item.normalizedNetworkCode).address,
+      tag: destinationByNetwork.get(item.normalizedNetworkCode).tag || "",
+      depositSource: destinationByNetwork.get(item.normalizedNetworkCode).source
+    }))
+    .sort((a, b) => {
+      if (a.withdrawFeeKnown !== b.withdrawFeeKnown) return a.withdrawFeeKnown ? -1 : 1;
+      return (a.withdrawFee ?? Number.MAX_SAFE_INTEGER) - (b.withdrawFee ?? Number.MAX_SAFE_INTEGER);
+    });
+  result.commonNetworks = common;
+
+  const selected = manualNetwork
+    ? common.find((item) => item.normalizedNetworkCode === manualNetwork)
+    : common[0];
+  if (!common.length) {
+    result.blockedBy = "NO_API_CONFIRMED_COMMON_NETWORK";
+    result.messages.push("API로 확인된 출금 가능 네트워크와 입금 가능 네트워크의 교집합이 없습니다.");
+    addRiskEvent("EXECUTION_PREFLIGHT_BLOCKED", "high", result.messages.join(" · "), { asset, sourceExchange, destinationExchange, sourceNetworks, destinationNetworks });
+    return result;
+  }
+  if (manualNetwork && !selected) {
+    result.blockedBy = "MANUAL_NETWORK_NOT_API_CONFIRMED";
+    result.messages.push(`수동 입력 네트워크 ${manualNetwork}가 API 확인 교집합에 없습니다.`);
+    addRiskEvent("EXECUTION_PREFLIGHT_BLOCKED", "high", result.messages.join(" · "), { asset, sourceExchange, destinationExchange, manualNetwork, common });
+    return result;
+  }
+
+  result.selectedNetwork = {
+    normalizedNetworkCode: selected.normalizedNetworkCode,
+    sourceNetworkCode: selected.networkCode,
+    destinationNetworkCode: selected.destinationNetworkCode,
+    withdrawFee: selected.withdrawFee,
+    withdrawFeeKnown: selected.withdrawFeeKnown,
+    withdrawFeeSource: selected.withdrawFeeSource || selected.source,
+    withdrawMin: selected.withdrawMin,
+    withdrawIntegerMultiple: selected.withdrawIntegerMultiple,
+    requiresTag: Boolean(selected.requiresTag || selected.tag)
+  };
+  result.address = {
+    exchange: destinationExchange,
+    asset,
+    networkCode: selected.destinationNetworkCode,
+    normalizedNetworkCode: selected.normalizedNetworkCode,
+    address: selected.address,
+    tag: selected.tag || "",
+    source: selected.depositSource
+  };
+  if (!selected.address) {
+    result.blockedBy = "API_DEPOSIT_ADDRESS_NOT_FOUND";
+    result.messages.push("도착 거래소 API에서 입금 주소를 받지 못했습니다.");
+    return result;
+  }
+  if (!selected.withdrawFeeKnown) {
+    result.blockedBy = "WITHDRAW_FEE_UNCONFIRMED";
+    result.messages.push("출금 수수료가 API에서 확인되지 않아 예상 차익 계산을 진행하지 않습니다.");
+    addRiskEvent("EXECUTION_PREFLIGHT_BLOCKED", "high", result.messages.join(" · "), { asset, sourceExchange, destinationExchange, selectedNetwork: selected.normalizedNetworkCode });
+    return result;
+  }
+  if (Number.isFinite(amount) && amount > 0 && selected.withdrawMin && amount < selected.withdrawMin) {
+    result.blockedBy = "WITHDRAW_MIN_NOT_MET";
+    result.messages.push(`출금 최소 수량 미달: ${formatPlain(amount)} < ${formatPlain(selected.withdrawMin)} ${asset}`);
+    return result;
+  }
+
+  result.canExecute = true;
+  result.latencyMs = Date.now() - startedAt;
+  result.messages.push("API 검증 통과: 주소록/.env 주소 fallback 없이 거래 실행 전 네트워크와 입금 주소를 확인했습니다.");
+  addBotEvent("EXECUTION_PREFLIGHT_OK", `${asset} ${sourceExchange}->${destinationExchange} ${selected.normalizedNetworkCode} API-only 확인`, {
+    source: selected.source,
+    destination: selected.depositSource
+  });
+  return result;
+}
+
+function normalizeRuntimeExchange(exchange) {
+  const value = String(exchange || "").trim().toLowerCase();
+  const map = {
+    upbit: "Upbit",
+    bithumb: "Bithumb",
+    binance: "Binance",
+    bybit: "Bybit",
+    bitget: "Bitget",
+    gate: "Gate.io",
+    gateio: "Gate.io",
+    "gate.io": "Gate.io"
+  };
+  return map[value] || "";
+}
+
+function apiCapabilityError(error, exchange, asset, kind) {
+  return {
+    ok: false,
+    exchange,
+    asset,
+    kind,
+    source: "API_ONLY",
+    networks: [],
+    error: error?.message || String(error)
+  };
+}
+
+async function cachedApiCapability(kind, exchange, asset, loader) {
+  const key = `${kind}:${exchange}:${asset}`;
+  const now = Date.now();
+  const cached = state.executionApiCache[key];
+  if (cached && now - cached.cachedAt < PREFLIGHT_CAPABILITY_CACHE_MS) {
+    return {
+      ...cached.value,
+      cache: {
+        hit: true,
+        ageMs: now - cached.cachedAt,
+        ttlMs: PREFLIGHT_CAPABILITY_CACHE_MS
+      }
+    };
+  }
+  const startedAt = Date.now();
+  const value = await loader();
+  const enriched = {
+    ...value,
+    cache: {
+      hit: false,
+      ageMs: 0,
+      ttlMs: PREFLIGHT_CAPABILITY_CACHE_MS,
+      latencyMs: Date.now() - startedAt
+    }
+  };
+  state.executionApiCache[key] = { cachedAt: now, value: enriched };
+  return enriched;
+}
+
+async function apiWithdrawalCapabilities(exchange, asset) {
+  if (exchange === "Binance") return binanceApiWithdrawalCapabilities(asset);
+  if (exchange === "Bybit") return bybitApiWithdrawalCapabilities(asset);
+  if (exchange === "Bitget") return bitgetApiWithdrawalCapabilities(asset);
+  if (exchange === "Gate.io") return gateApiWithdrawalCapabilities(asset);
+  if (exchange === "Upbit") return upbitApiWithdrawalCapabilities(asset);
+  if (exchange === "Bithumb") return bithumbApiWithdrawalCapabilities(asset);
+  return { ok: false, exchange, asset, kind: "withdraw", source: "API_ONLY", networks: [], error: "UNSUPPORTED_SOURCE_EXCHANGE" };
+}
+
+async function apiDepositCapabilities(exchange, asset) {
+  if (exchange === "Upbit") return upbitApiDepositCapabilities(asset);
+  if (exchange === "Binance") return binanceApiDepositCapabilities(asset);
+  if (exchange === "Bybit") return bybitApiDepositCapabilities(asset);
+  if (exchange === "Bitget") return bitgetApiDepositCapabilities(asset);
+  if (exchange === "Gate.io") return gateApiDepositCapabilities(asset);
+  if (exchange === "Bithumb") return bithumbApiDepositCapabilities(asset);
+  return { ok: false, exchange, asset, kind: "deposit", source: "API_ONLY", networks: [], error: "UNSUPPORTED_DESTINATION_EXCHANGE" };
+}
+
 function withdrawalQuote(payload) {
   const sourceExchange = normalizeWithdrawalExchange(payload.sourceExchange, WITHDRAWAL_SOURCE_EXCHANGES);
   const destinationExchange = normalizeWithdrawalExchange(payload.destinationExchange, WITHDRAWAL_DESTINATION_EXCHANGES);
   const asset = cleanAsset(payload.asset);
   const network = normalizeNetwork(payload.network || "");
+  const manualNetwork = normalizeNetwork(payload.manualNetwork || "");
   const amount = Number(payload.amount);
-  const option = withdrawalNetworkOptions(sourceExchange, destinationExchange, asset).find((item) => item.normalizedNetworkCode === network);
+  const knownOptions = withdrawalNetworkOptions(sourceExchange, destinationExchange, asset);
+  const option = knownOptions.find((item) => item.normalizedNetworkCode === network) ||
+    (manualNetwork ? { ...manualWithdrawalOption(sourceExchange, destinationExchange, asset, manualNetwork, knownOptions), depositEnabled: true, withdrawEnabled: true } : null);
   if (!option) {
     return {
       ok: true,
@@ -1948,6 +2687,7 @@ function withdrawalQuote(payload) {
   const messages = [];
   if (!option.depositEnabled) messages.push("도착 거래소 입금이 중지된 네트워크입니다.");
   if (!option.withdrawEnabled) messages.push("출발 거래소 출금이 중지된 네트워크입니다.");
+  if (option.manualOverride) messages.push("검증 통과: 수동 네트워크 입력 사용. 자동 교집합 인식 결과가 아니므로 실제 전송 전 거래소 화면에서 체인을 재확인해야 합니다.");
   if (!Number.isFinite(amount) || amount <= 0) messages.push("수량을 0보다 크게 입력하세요.");
   if (Number.isFinite(amount) && amount < option.withdrawMin) messages.push(`최소 출금 수량은 ${formatPlain(option.withdrawMin)} ${asset}입니다.`);
   if (Number.isFinite(amount) && Math.abs(quantizeAmount(amount, option.withdrawIntegerMultiple) - amount) > 1e-12) {
@@ -2181,6 +2921,307 @@ function updateWithdrawalRequest(request, sourceStatus, destinationStatus, trave
   request.events.push({ at: now, message });
 }
 
+function networkCapability({ exchange, asset, networkCode, source, withdrawEnabled = false, depositEnabled = false, withdrawFee = null, withdrawMin = 0, withdrawIntegerMultiple = 0.000001, address = "", tag = "", requiresTag = false, withdrawFeeSource = "" }) {
+  const normalizedNetworkCode = normalizeNetwork(networkCode);
+  const parsedWithdrawFee = parseOptionalNumber(withdrawFee);
+  return {
+    exchange,
+    asset,
+    networkCode: String(networkCode || normalizedNetworkCode),
+    normalizedNetworkCode,
+    withdrawEnabled: Boolean(withdrawEnabled),
+    depositEnabled: Boolean(depositEnabled),
+    withdrawFee: parsedWithdrawFee ?? 0,
+    withdrawFeeKnown: parsedWithdrawFee != null,
+    withdrawFeeSource: withdrawFeeSource || (parsedWithdrawFee != null ? source : ""),
+    withdrawMin: Number(withdrawMin || 0),
+    withdrawIntegerMultiple: Number(withdrawIntegerMultiple || 0.000001),
+    address: address || "",
+    tag: tag || "",
+    requiresTag: Boolean(requiresTag || tag),
+    source
+  };
+}
+
+function parseOptionalNumber(value) {
+  if (value == null || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function binanceApiWithdrawalCapabilities(asset) {
+  const response = await signedBinanceRequest("spot", "GET", "/sapi/v1/capital/config/getall", {});
+  const coin = Array.isArray(response.body) ? response.body.find((item) => item.coin === asset) : null;
+  if (!coin) return { ok: false, exchange: "Binance", asset, kind: "withdraw", source: "BINANCE_PRIVATE_CAPITAL_CONFIG", networks: [], error: "ASSET_NOT_FOUND" };
+  const networks = (coin.networkList || []).map((network) => networkCapability({
+    exchange: "Binance",
+    asset,
+    networkCode: network.network,
+    source: "BINANCE_PRIVATE_CAPITAL_CONFIG",
+    withdrawEnabled: network.withdrawEnable === true,
+    depositEnabled: network.depositEnable === true,
+    withdrawFee: network.withdrawFee,
+    withdrawMin: network.withdrawMin,
+    withdrawIntegerMultiple: network.withdrawIntegerMultiple || 0.000001,
+    requiresTag: Boolean(network.memoRegex)
+  }));
+  return { ok: true, exchange: "Binance", asset, kind: "withdraw", source: "BINANCE_PRIVATE_CAPITAL_CONFIG", networks };
+}
+
+async function binanceApiDepositCapabilities(asset) {
+  const caps = await binanceApiWithdrawalCapabilities(asset);
+  const networks = [];
+  for (const network of caps.networks.filter((item) => item.depositEnabled)) {
+    try {
+      const addressResponse = await signedBinanceRequest("spot", "GET", "/sapi/v1/capital/deposit/address", { coin: asset, network: network.networkCode });
+      const body = addressResponse.body || {};
+      networks.push(networkCapability({
+        ...network,
+        depositEnabled: Boolean(body.address),
+        address: body.address || "",
+        tag: body.tag || "",
+        source: "BINANCE_PRIVATE_DEPOSIT_ADDRESS"
+      }));
+    } catch (error) {
+      networks.push(networkCapability({
+        ...network,
+        depositEnabled: false,
+        source: "BINANCE_PRIVATE_DEPOSIT_ADDRESS",
+        address: "",
+        tag: ""
+      }));
+    }
+  }
+  return { ok: true, exchange: "Binance", asset, kind: "deposit", source: "BINANCE_PRIVATE_DEPOSIT_ADDRESS", networks };
+}
+
+async function upbitApiWithdrawalCapabilities(asset) {
+  const data = await signedUpbitGet("/v1/status/wallet", { markets: `KRW-${asset}` });
+  const rows = Array.isArray(data) ? data : [];
+  const networks = rows
+    .filter((item) => String(item.currency || "").toUpperCase() === asset || String(item.market || "").toUpperCase() === `KRW-${asset}`)
+    .map((item) => {
+      const state = String(item.wallet_state || item.state || "").toLowerCase();
+      const net = item.net_type || item.network || item.currency || asset;
+      return networkCapability({
+        exchange: "Upbit",
+        asset,
+        networkCode: net,
+        source: "UPBIT_PRIVATE_WALLET_STATUS",
+        withdrawEnabled: ["working", "withdraw_only"].includes(state),
+        depositEnabled: ["working", "deposit_only"].includes(state)
+      });
+    });
+  return { ok: true, exchange: "Upbit", asset, kind: "withdraw", source: "UPBIT_PRIVATE_WALLET_STATUS", networks };
+}
+
+async function upbitApiDepositCapabilities(asset) {
+  const data = await signedUpbitGet("/v1/deposits/coin_addresses", {});
+  const rows = Array.isArray(data) ? data : [];
+  const networks = rows
+    .filter((item) => String(item.currency || "").toUpperCase() === asset)
+    .map((item) => networkCapability({
+      exchange: "Upbit",
+      asset,
+      networkCode: item.net_type || item.network || asset,
+      source: "UPBIT_PRIVATE_DEPOSIT_ADDRESSES",
+      depositEnabled: Boolean(item.deposit_address),
+      withdrawEnabled: false,
+      address: item.deposit_address || "",
+      tag: item.secondary_address || item.memo || ""
+    }));
+  if (!networks.length) return { ok: false, exchange: "Upbit", asset, kind: "deposit", source: "UPBIT_PRIVATE_DEPOSIT_ADDRESSES", networks, error: "DEPOSIT_ADDRESS_NOT_FOUND" };
+  return { ok: true, exchange: "Upbit", asset, kind: "deposit", source: "UPBIT_PRIVATE_DEPOSIT_ADDRESSES", networks };
+}
+
+async function bybitApiWithdrawalCapabilities(asset) {
+  const response = await signedBybitRequest("GET", "/v5/asset/coin/query-info", { coin: asset });
+  const rows = response.body?.result?.rows || response.body?.result?.list || [];
+  const coin = rows.find((item) => String(item.coin || "").toUpperCase() === asset) || rows[0];
+  if (!coin) return { ok: false, exchange: "Bybit", asset, kind: "withdraw", source: "BYBIT_PRIVATE_COIN_INFO", networks: [], error: "ASSET_NOT_FOUND" };
+  const networks = (coin.chains || coin.chain || []).map((chain) => networkCapability({
+    exchange: "Bybit",
+    asset,
+    networkCode: chain.chain || chain.chainType || chain.chainName,
+    source: "BYBIT_PRIVATE_COIN_INFO",
+    withdrawEnabled: String(chain.chainWithdraw || chain.withdrawEnable || chain.withdrawable).toLowerCase() !== "0" && String(chain.chainWithdraw || chain.withdrawEnable || chain.withdrawable).toLowerCase() !== "false",
+    depositEnabled: String(chain.chainDeposit || chain.depositEnable || chain.depositable).toLowerCase() !== "0" && String(chain.chainDeposit || chain.depositEnable || chain.depositable).toLowerCase() !== "false",
+    withdrawFee: chain.withdrawFee || chain.withdrawFeeFixed,
+    withdrawMin: chain.withdrawMin || chain.minWithdrawAmt,
+    withdrawIntegerMultiple: chain.withdrawPrecision ? 1 / Math.pow(10, Number(chain.withdrawPrecision)) : 0.000001,
+    requiresTag: Boolean(chain.needTag)
+  }));
+  return { ok: true, exchange: "Bybit", asset, kind: "withdraw", source: "BYBIT_PRIVATE_COIN_INFO", networks };
+}
+
+async function bybitApiDepositCapabilities(asset) {
+  const source = await bybitApiWithdrawalCapabilities(asset);
+  const networks = [];
+  for (const network of source.networks.filter((item) => item.depositEnabled)) {
+    try {
+      const response = await signedBybitRequest("GET", "/v5/asset/deposit/query-address", { coin: asset, chainType: network.networkCode });
+      const result = response.body?.result || {};
+      const chains = result.chains || result.chain || [];
+      const addressRow = Array.isArray(chains) ? chains[0] : result;
+      networks.push(networkCapability({
+        ...network,
+        depositEnabled: Boolean(addressRow.addressDeposit || addressRow.address),
+        address: addressRow.addressDeposit || addressRow.address || "",
+        tag: addressRow.tagDeposit || addressRow.tag || "",
+        source: "BYBIT_PRIVATE_DEPOSIT_ADDRESS"
+      }));
+    } catch {
+      networks.push(networkCapability({ ...network, depositEnabled: false, source: "BYBIT_PRIVATE_DEPOSIT_ADDRESS" }));
+    }
+  }
+  return { ok: true, exchange: "Bybit", asset, kind: "deposit", source: "BYBIT_PRIVATE_DEPOSIT_ADDRESS", networks };
+}
+
+async function bitgetApiWithdrawalCapabilities(asset) {
+  if (!process.env.BITGET_API_KEY || !process.env.BITGET_API_SECRET || !process.env.BITGET_API_PASSPHRASE) {
+    throw new Error("Missing Bitget API credentials");
+  }
+  const response = await fetchJson("https://api.bitget.com/api/v2/spot/public/coins");
+  const coin = (response.data || []).find((item) => String(item.coin || "").toUpperCase() === asset);
+  if (!coin) return { ok: false, exchange: "Bitget", asset, kind: "withdraw", source: "BITGET_PUBLIC_COINS_API", networks: [], error: "ASSET_NOT_FOUND" };
+  const networks = (coin.chains || []).map((chain) => networkCapability({
+    exchange: "Bitget",
+    asset,
+    networkCode: chain.chain,
+    source: "BITGET_PUBLIC_COINS_API",
+    withdrawEnabled: String(chain.withdrawable) === "true",
+    depositEnabled: String(chain.rechargeable) === "true",
+    withdrawFee: chain.withdrawFee || chain.withdrawalFee,
+    withdrawMin: chain.withdrawMin || chain.minWithdrawAmount,
+    withdrawIntegerMultiple: 0.000001,
+    requiresTag: Boolean(chain.needTag)
+  }));
+  return { ok: true, exchange: "Bitget", asset, kind: "withdraw", source: "BITGET_PUBLIC_COINS_API", networks };
+}
+
+async function bitgetApiDepositCapabilities(asset) {
+  const source = await bitgetApiWithdrawalCapabilities(asset);
+  const networks = [];
+  for (const network of source.networks.filter((item) => item.depositEnabled)) {
+    try {
+      const response = await signedBitgetRequest("GET", "/api/v2/spot/wallet/deposit-address", { coin: asset, chain: network.networkCode });
+      const body = response.body?.data || {};
+      networks.push(networkCapability({
+        ...network,
+        depositEnabled: Boolean(body.address),
+        address: body.address || "",
+        tag: body.tag || body.memo || "",
+        source: "BITGET_PRIVATE_DEPOSIT_ADDRESS"
+      }));
+    } catch {
+      networks.push(networkCapability({ ...network, depositEnabled: false, source: "BITGET_PRIVATE_DEPOSIT_ADDRESS" }));
+    }
+  }
+  return { ok: true, exchange: "Bitget", asset, kind: "deposit", source: "BITGET_PRIVATE_DEPOSIT_ADDRESS", networks };
+}
+
+async function gateApiWithdrawalCapabilities(asset) {
+  if (!process.env.GATE_API_KEY || !process.env.GATE_API_SECRET) {
+    throw new Error("Missing Gate API credentials");
+  }
+  const currencies = await fetchJson("https://api.gateio.ws/api/v4/spot/currencies");
+  const item = currencies.find((row) => String(row.currency || "").toUpperCase() === asset);
+  if (!item) return { ok: false, exchange: "Gate.io", asset, kind: "withdraw", source: "GATE_PUBLIC_CURRENCIES_API", networks: [], error: "ASSET_NOT_FOUND" };
+  const chains = Array.isArray(item.chains) ? item.chains : [];
+  const networks = chains.map((chain) => networkCapability({
+    exchange: "Gate.io",
+    asset,
+    networkCode: chain.name || chain.chain || chain,
+    source: "GATE_PUBLIC_CURRENCIES_API",
+    withdrawEnabled: chain.withdraw_disabled !== true && item.withdraw_disabled !== true && item.withdraw_delayed !== true,
+    depositEnabled: chain.deposit_disabled !== true && item.deposit_disabled !== true,
+    withdrawFee: chain.withdraw_txfee || chain.withdraw_fee || 0,
+    withdrawMin: chain.withdraw_amount_mini || 0,
+    withdrawIntegerMultiple: 0.000001
+  }));
+  return { ok: true, exchange: "Gate.io", asset, kind: "withdraw", source: "GATE_PUBLIC_CURRENCIES_API", networks };
+}
+
+async function gateApiDepositCapabilities(asset) {
+  return { ok: false, exchange: "Gate.io", asset, kind: "deposit", source: "API_ONLY", networks: [], error: "GATE_DEPOSIT_ADDRESS_API_NOT_IMPLEMENTED" };
+}
+
+async function bithumbApiWithdrawalCapabilities(asset) {
+  const data = await fetchJson(`https://api.bithumb.com/public/assetsstatus/multichain/${asset}`);
+  const feeByNetwork = await bithumbFeeByNetwork(asset);
+  if (data.status !== "0000") return { ok: false, exchange: "Bithumb", asset, kind: "withdraw", source: "BITHUMB_PUBLIC_MULTICHAIN_STATUS", networks: [], error: `BITHUMB_STATUS_${data.status || "UNKNOWN"}` };
+  const rows = Array.isArray(data.data) ? data.data : Object.values(data.data || {});
+  const networks = rows.map((item) => {
+    const networkCode = item.net_type || item.network || item.currency;
+    const fee = feeByNetwork[normalizeNetwork(networkCode)] || {};
+    return networkCapability({
+      exchange: "Bithumb",
+      asset,
+      networkCode,
+      source: "BITHUMB_PUBLIC_MULTICHAIN_STATUS",
+      withdrawEnabled: Number(item.withdrawal_status) === 1,
+      depositEnabled: Number(item.deposit_status) === 1,
+      withdrawFee: estimateWithdrawFeeFromPolicy(fee, null),
+      withdrawMin: fee.withdrawMin,
+      withdrawFeeSource: fee.source
+    });
+  });
+  return { ok: true, exchange: "Bithumb", asset, kind: "withdraw", source: "BITHUMB_PUBLIC_MULTICHAIN_STATUS", networks };
+}
+
+async function bithumbApiDepositCapabilities(asset) {
+  const status = await bithumbApiWithdrawalCapabilities(asset);
+  const networks = [];
+  for (const network of status.networks.filter((item) => item.depositEnabled)) {
+    try {
+      const address = await signedBithumbGet("/v1/deposits/coin_address", { currency: asset, net_type: network.networkCode });
+      networks.push(networkCapability({
+        ...network,
+        depositEnabled: Boolean(address.deposit_address || address.address),
+        address: address.deposit_address || address.address || "",
+        tag: address.secondary_address || address.memo || "",
+        source: "BITHUMB_PRIVATE_DEPOSIT_ADDRESS"
+      }));
+    } catch {
+      networks.push(networkCapability({ ...network, depositEnabled: false, source: "BITHUMB_PRIVATE_DEPOSIT_ADDRESS" }));
+    }
+  }
+  return { ok: true, exchange: "Bithumb", asset, kind: "deposit", source: "BITHUMB_PRIVATE_DEPOSIT_ADDRESS", networks };
+}
+
+async function bithumbFeeByNetwork(asset) {
+  try {
+    const rows = await fetchJson(`https://api.bithumb.com/v2/fee/inout/${asset}`);
+    const coin = Array.isArray(rows) ? rows.find((item) => String(item.currency || "").toUpperCase() === asset) || rows[0] : rows;
+    const networks = coin?.networks || [];
+    return Object.fromEntries(networks.map((item) => {
+      const network = normalizeNetwork(item.net_name || item.net_type || item.network || asset);
+      return [network, {
+        withdrawFee: parseOptionalNumber(item.withdraw_fee_quantity ?? item.withdraw_fee),
+        withdrawRate: parseOptionalNumber(item.withdraw_rate),
+        withdrawFeeMin: parseOptionalNumber(item.withdraw_fee_min),
+        withdrawFeeMax: parseOptionalNumber(item.withdraw_fee_max),
+        withdrawMin: parseOptionalNumber(item.withdraw_minimum_quantity ?? item.withdraw_minimum ?? item.withdraw_min),
+        source: "BITHUMB_PUBLIC_INOUT_FEE"
+      }];
+    }));
+  } catch (error) {
+    addRiskEvent("BITHUMB_WITHDRAW_FEE_LOOKUP_DELAYED", "medium", `빗썸 ${asset} 출금 수수료 조회 지연: ${error.message}`, { asset });
+    return {};
+  }
+}
+
+function estimateWithdrawFeeFromPolicy(policy = {}, amount = null) {
+  if (policy.withdrawFee != null) return policy.withdrawFee;
+  if (policy.withdrawRate == null) return null;
+  const quantity = Number(amount);
+  if (!Number.isFinite(quantity) || quantity <= 0) return null;
+  let fee = quantity * policy.withdrawRate;
+  if (policy.withdrawFeeMin != null) fee = Math.max(fee, policy.withdrawFeeMin);
+  if (policy.withdrawFeeMax != null) fee = Math.min(fee, policy.withdrawFeeMax);
+  return fee;
+}
+
 function withdrawalNetworkOptions(sourceExchange, destinationExchange, asset) {
   const destinationNetworks = WITHDRAWAL_DESTINATION_NETWORKS[destinationExchange]?.[asset] ?? {};
   const normalizedDestination = Object.fromEntries(Object.entries(destinationNetworks).map(([network, enabled]) => [normalizeNetwork(network), enabled]));
@@ -2312,8 +3353,51 @@ function withdrawalSafety() {
   };
 }
 
+async function pollTelegramCommands() {
+  if (!state.settings.telegramCommandEnabled) return;
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = String(process.env.TELEGRAM_CHAT_ID || "");
+  if (!token || !chatId) return;
+  const url = new URL(`https://api.telegram.org/bot${token}/getUpdates`);
+  url.searchParams.set("timeout", "0");
+  if (state.settings.telegramLastUpdateId) url.searchParams.set("offset", String(state.settings.telegramLastUpdateId + 1));
+  const data = await fetchJson(url.toString());
+  for (const update of data.result || []) {
+    state.settings.telegramLastUpdateId = Math.max(state.settings.telegramLastUpdateId || 0, update.update_id || 0);
+    const message = update.message || update.edited_message;
+    const text = String(message?.text || "").trim().toLowerCase();
+    if (String(message?.chat?.id || "") !== chatId) continue;
+    if (text === "/off") {
+      state.settings.emergencyStop = true;
+      state.settings.autoPaperTrading = false;
+      addBotEvent("TELEGRAM_OFF", "Telegram /off 명령으로 자동 거래를 정지했습니다.");
+      await telegramSend("OFF: emergency stop ON, auto paper OFF");
+    } else if (text === "/on") {
+      state.settings.emergencyStop = false;
+      state.settings.autoPaperTrading = true;
+      addBotEvent("TELEGRAM_ON", "Telegram /on 명령으로 자동 모의 거래를 켰습니다.");
+      await telegramSend("ON: emergency stop OFF, auto paper ON");
+    } else if (text === "/status") {
+      await telegramSend(`status: autoPaper=${state.settings.autoPaperTrading}, emergency=${state.settings.emergencyStop}, live=${state.settings.liveTrading}`);
+    }
+  }
+}
+
+async function telegramSend(text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+  await fetchWithTimeout(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text })
+  });
+}
+
 function formatPlain(value) {
-  return Number(value).toLocaleString("en-US", { maximumFractionDigits: 12, useGrouping: false });
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return number.toLocaleString("en-US", { maximumFractionDigits: 12, useGrouping: false });
 }
 
 async function handleInternalTransfer(params) {
@@ -2717,7 +3801,7 @@ async function signedBinanceRequest(market, method, endpoint, params) {
   });
   const signature = crypto.createHmac("sha256", secret).update(query.toString()).digest("hex");
   query.set("signature", signature);
-  const res = await fetch(`${baseUrl}${endpoint}?${query.toString()}`, {
+  const res = await fetchWithTimeout(`${baseUrl}${endpoint}?${query.toString()}`, {
     method,
     headers: { "X-MBX-APIKEY": apiKey }
   });
@@ -2732,10 +3816,12 @@ async function signedBybitRequest(method, endpoint, body = {}) {
   if (!apiKey || !secret) throw new Error("Missing Bybit API credentials");
   const timestamp = String(Date.now());
   const recvWindow = "5000";
+  const query = method === "GET" ? new URLSearchParams(body).toString() : "";
+  const requestPath = `${endpoint}${query ? `?${query}` : ""}`;
   const bodyText = method === "GET" ? "" : JSON.stringify(body);
-  const payload = `${timestamp}${apiKey}${recvWindow}${bodyText}`;
+  const payload = `${timestamp}${apiKey}${recvWindow}${method === "GET" ? query : bodyText}`;
   const signature = crypto.createHmac("sha256", secret).update(payload).digest("hex");
-  const res = await fetch(`https://api.bybit.com${endpoint}`, {
+  const res = await fetchWithTimeout(`https://api.bybit.com${requestPath}`, {
     method,
     headers: {
       "X-BAPI-API-KEY": apiKey,
@@ -2757,10 +3843,12 @@ async function signedBitgetRequest(method, endpoint, body = {}) {
   const passphrase = process.env.BITGET_API_PASSPHRASE;
   if (!apiKey || !secret || !passphrase) throw new Error("Missing Bitget API credentials");
   const timestamp = String(Date.now());
+  const query = method === "GET" ? new URLSearchParams(body).toString() : "";
+  const requestPath = `${endpoint}${query ? `?${query}` : ""}`;
   const bodyText = method === "GET" ? "" : JSON.stringify(body);
-  const prehash = `${timestamp}${method}${endpoint}${bodyText}`;
+  const prehash = `${timestamp}${method}${requestPath}${bodyText}`;
   const signature = crypto.createHmac("sha256", secret).update(prehash).digest("base64");
-  const res = await fetch(`https://api.bitget.com${endpoint}`, {
+  const res = await fetchWithTimeout(`https://api.bitget.com${requestPath}`, {
     method,
     headers: {
       "ACCESS-KEY": apiKey,
@@ -2782,13 +3870,14 @@ async function signedGateRequest(method, endpoint, body = {}) {
   const secret = process.env.GATE_API_SECRET;
   if (!apiKey || !secret) throw new Error("Missing Gate API credentials");
   const prefix = "/api/v4";
-  const query = "";
+  const query = method === "GET" ? new URLSearchParams(body).toString() : "";
+  const requestPath = `${endpoint}${query ? `?${query}` : ""}`;
   const bodyText = method === "GET" ? "" : JSON.stringify(body);
   const timestamp = String(Math.floor(Date.now() / 1000));
   const bodyHash = crypto.createHash("sha512").update(bodyText).digest("hex");
   const signString = `${method}\n${prefix}${endpoint}\n${query}\n${bodyHash}\n${timestamp}`;
   const signature = crypto.createHmac("sha512", secret).update(signString).digest("hex");
-  const res = await fetch(`https://api.gateio.ws${prefix}${endpoint}`, {
+  const res = await fetchWithTimeout(`https://api.gateio.ws${prefix}${requestPath}`, {
     method,
     headers: {
       "KEY": apiKey,
@@ -2802,6 +3891,40 @@ async function signedGateRequest(method, endpoint, body = {}) {
   const responseBody = await safeJson(res);
   if (!res.ok) throw new Error(`Gate request failed: ${JSON.stringify(redact(responseBody))}`);
   return { exchange: "gate", endpoint, body: redact(responseBody) };
+}
+
+async function signedBithumbGet(endpoint, params = {}) {
+  const query = new URLSearchParams(params).toString();
+  const token = signBithumbToken(query);
+  const res = await fetchWithTimeout(`https://api.bithumb.com${endpoint}${query ? `?${query}` : ""}`, {
+    method: "GET",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json; charset=utf-8"
+    }
+  });
+  const responseBody = await safeJson(res);
+  if (!res.ok) throw new Error(`Bithumb GET failed: ${JSON.stringify(redact(responseBody))}`);
+  return responseBody;
+}
+
+function signBithumbToken(query = "") {
+  const accessKey = process.env.BITHUMB_API_KEY;
+  const secretKey = process.env.BITHUMB_API_SECRET;
+  if (!accessKey || !secretKey) throw new Error("Missing Bithumb API credentials");
+  const payload = {
+    access_key: accessKey,
+    nonce: crypto.randomUUID(),
+    timestamp: Date.now()
+  };
+  if (query) {
+    payload.query_hash = crypto.createHash("sha512").update(query, "utf8").digest("hex");
+    payload.query_hash_alg = "SHA512";
+  }
+  const header = base64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const body = base64url(JSON.stringify(payload));
+  const signature = base64url(crypto.createHmac("sha256", secretKey).update(`${header}.${body}`).digest());
+  return `${header}.${body}.${signature}`;
 }
 
 async function upbitLimitSell(asset, quantity, price, identifier) {
@@ -2820,7 +3943,7 @@ async function upbitLimitSell(asset, quantity, price, identifier) {
 async function signedUpbitGet(endpoint, params = {}) {
   const query = new URLSearchParams(params).toString();
   const token = signUpbitToken(query);
-  const res = await fetch(`https://api.upbit.com${endpoint}${query ? `?${query}` : ""}`, {
+  const res = await fetchWithTimeout(`https://api.upbit.com${endpoint}${query ? `?${query}` : ""}`, {
     method: "GET",
     headers: { "Authorization": `Bearer ${token}` }
   });
@@ -2832,7 +3955,7 @@ async function signedUpbitGet(endpoint, params = {}) {
 async function signedUpbitRequest(method, endpoint, body) {
   const query = new URLSearchParams(body).toString();
   const token = signUpbitToken(query);
-  const res = await fetch(`https://api.upbit.com${endpoint}`, {
+  const res = await fetchWithTimeout(`https://api.upbit.com${endpoint}`, {
     method,
     headers: {
       "Authorization": `Bearer ${token}`,
@@ -2868,6 +3991,19 @@ async function safeJson(res) {
     return JSON.parse(text);
   } catch {
     return { text };
+  }
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = API_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error(`API_TIMEOUT_${timeoutMs}ms`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -2925,7 +4061,7 @@ function settledSet(result, fallback) {
 }
 
 async function fetchJson(url) {
-  const res = await fetch(url, { headers: { "accept": "application/json" } });
+  const res = await fetchWithTimeout(url, { headers: { "accept": "application/json" } });
   if (!res.ok) throw new Error(`${url} ${res.status}`);
   return await res.json();
 }
